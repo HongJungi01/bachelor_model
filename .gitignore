@@ -1,0 +1,63 @@
+# === Build outputs ===
+rtabmap/build/
+rtabmap_2d_pipeline/build/
+
+# === vcpkg pre-built dependencies (large, downloadable) ===
+vcpkg_export/
+vcpkg-export.7z
+
+# === Third-party source (not our code) ===
+pugixml-1.15/
+temp_extract_test/
+
+# === RTAB-Map: build에 불필요한 디렉토리 ===
+rtabmap/app/android/
+rtabmap/app/ios/
+rtabmap/archive/
+rtabmap/data/
+rtabmap/docker/
+rtabmap/examples/
+rtabmap/patches/
+rtabmap/vcpkg/
+rtabmap/.devcontainer/
+rtabmap/.github/
+rtabmap/.settings/
+rtabmap/.cproject
+rtabmap/.project
+rtabmap/.dockerignore
+rtabmap/bundle_deps_log*.txt
+rtabmap/bundle_windows_deps*.bat
+rtabmap/mainpage.dox
+rtabmap/package.xml
+
+# === IDE / Editor ===
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+
+# === OS ===
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# === RTAB-Map runtime ===
+*.db
+*.db-wal
+*.db-shm
+output/
+
+# === Logs ===
+*.log
+build_log*.txt
+
+# === Python ===
+__pycache__/
+*.pyc
+
+# === Environment ===
+.env
+
+# === Legacy ===
+setup_wsl.sh

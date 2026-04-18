@@ -103,6 +103,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "rtabmap/core/util3d_surface.h"
 #include "rtabmap/core/util3d_registration.h"
 #include "rtabmap/core/optimizer/OptimizerCVSBA.h"
+#include "rtabmap/gui/GridTcpStreamer.h"
 #include "rtabmap/core/Graph.h"
 #include "rtabmap/core/RegistrationIcp.h"
 #include <pcl/visualization/cloud_viewer.h>
@@ -183,7 +184,9 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	_autoScreenCaptureRAM(false),
 	_autoScreenCapturePNG(false),
 	_firstCall(true),
-	_progressCanceled(false)
+	_progressCanceled(false),
+	_gridTcpStreamer(0),
+	_actionTcpGridStreaming(0)
 {
 	ULogger::registerCurrentThread("MainWindow");
 	UDEBUG("");
@@ -416,6 +419,14 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	connect(_ui->actionData_recorder, SIGNAL(triggered()), this, SLOT(dataRecorder()));
 	connect(_ui->actionPost_processing, SIGNAL(triggered()), this, SLOT(showPostProcessingDialog()));
 	connect(_ui->actionDepth_Calibration, SIGNAL(triggered()), this, SLOT(depthCalibration()));
+
+	// TCP Grid Streaming action in Tools menu
+	_actionTcpGridStreaming = new QAction(tr("TCP Grid Streaming (port 7777)"), this);
+	_actionTcpGridStreaming->setCheckable(true);
+	_actionTcpGridStreaming->setChecked(false);
+	_ui->menuTools->addSeparator();
+	_ui->menuTools->addAction(_actionTcpGridStreaming);
+	connect(_actionTcpGridStreaming, SIGNAL(toggled(bool)), this, SLOT(toggleTcpGridStreaming(bool)));
 
 	_ui->actionPause->setShortcut(Qt::Key_Space);
 	_ui->actionSave_GUI_config->setShortcut(QKeySequence::Save);
@@ -738,6 +749,7 @@ MainWindow::~MainWindow()
 	delete _elevationMap;
 #endif
 	delete _occupancyGrid;
+	delete _gridTcpStreamer;
 	UDEBUG("");
 }
 
@@ -3054,7 +3066,8 @@ void MainWindow::updateMapCloud(
 			// occupancy grids
 			bool updateGridMap =
 					((_ui->graphicsView_graphView->isVisible() && _ui->graphicsView_graphView->isGridMapVisible()) ||
-					 (_cloudViewer->isVisible() && _preferencesDialog->getGridMapShown())) &&
+					 (_cloudViewer->isVisible() && _preferencesDialog->getGridMapShown()) ||
+					 (_gridTcpStreamer && _gridTcpStreamer->isListening())) &&
 					_occupancyGrid->addedNodes().find(iter->first) == _occupancyGrid->addedNodes().end();
 			bool updateOctomap = false;
 			bool updateElevationMap = false;
@@ -3536,8 +3549,10 @@ void MainWindow::updateMapCloud(
 		}
 	}
 	cv::Mat map8U;
+	bool tcpStreamingActive = _gridTcpStreamer && _gridTcpStreamer->isListening() && _gridTcpStreamer->clientCount() > 0;
 	if((_ui->graphicsView_graphView->isVisible() && _ui->graphicsView_graphView->isGridMapVisible()) ||
-	   (_cloudViewer->isVisible() && _preferencesDialog->getGridMapShown()))
+	   (_cloudViewer->isVisible() && _preferencesDialog->getGridMapShown()) ||
+	   tcpStreamingActive)
 	{
 		float xMin, yMin;
 		float resolution = _occupancyGrid->getCellSize();
@@ -3564,6 +3579,19 @@ void MainWindow::updateMapCloud(
 		{
 			//convert to gray scaled map
 			map8U = util3d::convertMap2Image8U(map8S);
+
+			// TCP Grid Streaming — send raw grid to connected clients
+			if(_gridTcpStreamer && _gridTcpStreamer->isListening() && _gridTcpStreamer->clientCount() > 0)
+			{
+				float poseX = 0, poseY = 0, poseYaw = 0;
+				if(!_lastOdomPose.isNull())
+				{
+					poseX = _lastOdomPose.x();
+					poseY = _lastOdomPose.y();
+					poseYaw = _lastOdomPose.theta();
+				}
+				_gridTcpStreamer->sendGrid(map8S, xMin, yMin, resolution, poseX, poseY, poseYaw);
+			}
 
 			if(_cloudViewer->isVisible() && _preferencesDialog->getGridMapShown())
 			{
@@ -7818,7 +7846,7 @@ void MainWindow::setDefaultViews()
 	_ui->dockWidget_console->setVisible(false);
 	_ui->dockWidget_loopClosureViewer->setVisible(false);
 	_ui->dockWidget_mapVisibility->setVisible(false);
-	_ui->dockWidget_graphViewer->setVisible(false);
+	_ui->dockWidget_graphViewer->setVisible(true);
 	_ui->dockWidget_odometry->setVisible(true);
 	_ui->dockWidget_cloudViewer->setVisible(true);
 	_ui->dockWidget_imageView->setVisible(true);
@@ -8942,6 +8970,64 @@ void MainWindow::changeState(MainWindow::State newState)
 		break;
 	}
 
+}
+
+ParametersMap MainWindow::getCustomParameters()
+{
+	// D455f-optimized defaults for 2D occupancy grid SLAM
+	ParametersMap p;
+
+	// Occupancy grid parameters (tuned for D455f depth range)
+	p.insert(ParametersPair(Parameters::kGridCellSize(),            "0.05"));
+	p.insert(ParametersPair(Parameters::kGridRangeMax(),            "6.0"));
+	p.insert(ParametersPair(Parameters::kGridRangeMin(),            "0.3"));
+	p.insert(ParametersPair(Parameters::kGridRayTracing(),          "true"));
+	p.insert(ParametersPair(Parameters::kGridDepthDecimation(),     "2"));
+	p.insert(ParametersPair(Parameters::kGridMaxObstacleHeight(),   "1.5"));
+	p.insert(ParametersPair(Parameters::kGridMaxGroundHeight(),     "0.15"));
+	p.insert(ParametersPair(Parameters::kGridNormalsSegmentation(), "true"));
+	p.insert(ParametersPair(Parameters::kGridMaxGroundAngle(),      "45"));
+
+	// Optimizer — use gravity prior from D455f IMU
+	p.insert(ParametersPair(Parameters::kOptimizerGravitySigma(),   "0.3"));
+
+	// Odometry — align first frame with gravity direction (IMU)
+	p.insert(ParametersPair(Parameters::kOdomAlignWithGround(),     "true"));
+
+	// Visual registration
+	p.insert(ParametersPair(Parameters::kRegStrategy(),             "0"));   // 0=Visual
+	p.insert(ParametersPair(Parameters::kVisMinInliers(),           "15"));
+
+	return p;
+}
+
+void MainWindow::toggleTcpGridStreaming(bool enabled)
+{
+	if(enabled)
+	{
+		if(!_gridTcpStreamer)
+		{
+			_gridTcpStreamer = new GridTcpStreamer(7777, this);
+			connect(_gridTcpStreamer, SIGNAL(statusMessage(QString)), this, SLOT(onTcpStatusMessage(QString)));
+		}
+		if(_gridTcpStreamer->startListening())
+		{
+			this->statusBar()->showMessage(tr("TCP Grid Streaming started on port 7777"), 5000);
+		}
+	}
+	else
+	{
+		if(_gridTcpStreamer)
+		{
+			_gridTcpStreamer->stopListening();
+			this->statusBar()->showMessage(tr("TCP Grid Streaming stopped"), 5000);
+		}
+	}
+}
+
+void MainWindow::onTcpStatusMessage(const QString & msg)
+{
+	this->statusBar()->showMessage(msg, 5000);
 }
 
 }

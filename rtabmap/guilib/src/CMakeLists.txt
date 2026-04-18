@@ -37,6 +37,7 @@ SET(headers_ui
 	../include/${PROJECT_PREFIX}/gui/MultiSessionLocWidget.h
 	../include/${PROJECT_PREFIX}/gui/MultiSessionLocSubView.h
 	../include/${PROJECT_PREFIX}/gui/LinkRefiningDialog.h
+	../include/${PROJECT_PREFIX}/gui/GridTcpStreamer.h
 )
 
 SET(qrc 
@@ -83,6 +84,7 @@ SET(SRC_FILES
 	./ParametersToolBox.cpp
 	./DepthCalibrationDialog.cpp
 	./LinkRefiningDialog.cpp
+	./GridTcpStreamer.cpp
 	./3rdParty/QMultiComboBox.cpp
 	./opencv/vtkImageMatSource.cpp
 	${qrc}
@@ -109,7 +111,7 @@ SET(PUBLIC_INCLUDE_DIRS "")
 
 IF(Qt6_FOUND)
     SET(PUBLIC_LIBRARIES ${PUBLIC_LIBRARIES} Qt6::Widgets Qt6::Core Qt6::Gui Qt6::OpenGL)
-    SET(LIBRARIES ${LIBRARIES} Qt6::PrintSupport)
+    SET(LIBRARIES ${LIBRARIES} Qt6::PrintSupport Qt6::Network)
     IF(Qt6Svg_FOUND)
         SET(LIBRARIES ${LIBRARIES} Qt6::Svg)
     ENDIF()
