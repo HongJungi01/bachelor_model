@@ -22,14 +22,14 @@
 
 ## 1. 사전 조건
 
-| 항목            | 버전/사양                         | 설치 방법                          |
-| --------------- | --------------------------------- | ---------------------------------- |
-| Visual Studio   | 2022 Community (MSVC 19.44+)      | [visualstudio.com](https://visualstudio.microsoft.com/) |
-| C++ 워크로드    | "C++를 사용한 데스크톱 개발"       | VS Installer에서 체크              |
-| Windows SDK     | 10.0.22621.0 이상                 | VS Installer에 포함                |
-| 7-Zip           | 최신                              | `choco install 7zip -y`           |
-| Git             | 최신                              | `winget install Git.Git`          |
-| 카메라          | Intel RealSense D455f (USB 3.0)   | USB 3.0 포트에 직접 연결          |
+| 항목          | 버전/사양                       | 설치 방법                                               |
+| ------------- | ------------------------------- | ------------------------------------------------------- |
+| Visual Studio | 2022 Community (MSVC 19.44+)    | [visualstudio.com](https://visualstudio.microsoft.com/) |
+| C++ 워크로드  | "C++를 사용한 데스크톱 개발"    | VS Installer에서 체크                                   |
+| Windows SDK   | 10.0.22621.0 이상               | VS Installer에 포함                                     |
+| 7-Zip         | 최신                            | `choco install 7zip -y`                                 |
+| Git           | 최신                            | `winget install Git.Git`                                |
+| 카메라        | Intel RealSense D455f (USB 3.0) | USB 3.0 포트에 직접 연결                                |
 
 > **CMake**는 VS2022에 번들 포함되어 있어 별도 설치 불필요.
 
@@ -52,14 +52,14 @@ Invoke-WebRequest -Uri $url -OutFile "vcpkg_export.7z"
 
 압축 해제 후 `C:\dev\vcpkg_export\installed\x64-windows-release\` 에 라이브러리 설치됨:
 
-| 라이브러리     | 버전    |
-| -------------- | ------- |
-| Qt             | 6.10.0  |
-| VTK            | 9.3     |
-| PCL            | 1.15.1  |
-| OpenCV         | 4.12.0  |
-| librealsense   | 2.56.2  |
-| g2o, Eigen, Boost | 최신 |
+| 라이브러리        | 버전   |
+| ----------------- | ------ |
+| Qt                | 6.10.0 |
+| VTK               | 9.3    |
+| PCL               | 1.15.1 |
+| OpenCV            | 4.12.0 |
+| librealsense      | 2.56.2 |
+| g2o, Eigen, Boost | 최신   |
 
 ---
 
@@ -145,12 +145,12 @@ $env:QT_PLUGIN_PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\Qt6\plu
 
 ### GUI 패널 구성
 
-| 패널              | 내용                          |
-| ----------------- | ----------------------------- |
-| 3D Map            | 3D 포인트클라우드 + 카메라 경로 |
-| Graph View        | **2D Occupancy Grid** (점유 그리드) |
-| Loop Closure      | 루프 클로저 탐지 시각화        |
-| Odometry          | 프레임간 특징점 매칭           |
+| 패널         | 내용                                |
+| ------------ | ----------------------------------- |
+| 3D Map       | 3D 포인트클라우드 + 카메라 경로     |
+| Graph View   | **2D Occupancy Grid** (점유 그리드) |
+| Loop Closure | 루프 클로저 탐지 시각화             |
+| Odometry     | 프레임간 특징점 매칭                |
 
 ---
 
@@ -168,19 +168,19 @@ $env:QT_PLUGIN_PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\Qt6\plu
 
 Start 시 `getCustomParameters()`에서 자동 적용됨 (별도 설정 불필요):
 
-| 파라미터                   | 값     | 의미                         |
-| -------------------------- | ------ | ---------------------------- |
-| `Grid/CellSize`            | `0.05` | 5cm 해상도                   |
-| `Grid/RangeMax`            | `6.0`  | D455f depth 상한 6m          |
-| `Grid/RangeMin`            | `0.3`  | D455f depth 하한 0.3m        |
-| `Grid/RayTracing`          | `true` | 센서~장애물 사이 free 마킹   |
-| `Grid/DepthDecimation`     | `2`    | 해상도 2배 축소 (성능)       |
-| `Grid/MaxObstacleHeight`   | `1.5`  | 1.5m 이상 장애물 무시        |
-| `Grid/MaxGroundHeight`     | `0.15` | 바닥 판정 최대 15cm          |
-| `Optimizer/GravitySigma`   | `0.3`  | IMU gravity constraint       |
-| `Odom/AlignWithGround`     | `true` | IMU 기반 중력 정렬           |
-| `Reg/Strategy`             | `0`    | Visual registration          |
-| `Vis/MinInliers`           | `15`   | 최소 inlier 수               |
+| 파라미터                 | 값     | 의미                       |
+| ------------------------ | ------ | -------------------------- |
+| `Grid/CellSize`          | `0.05` | 5cm 해상도                 |
+| `Grid/RangeMax`          | `6.0`  | D455f depth 상한 6m        |
+| `Grid/RangeMin`          | `0.3`  | D455f depth 하한 0.3m      |
+| `Grid/RayTracing`        | `true` | 센서~장애물 사이 free 마킹 |
+| `Grid/DepthDecimation`   | `2`    | 해상도 2배 축소 (성능)     |
+| `Grid/MaxObstacleHeight` | `1.5`  | 1.5m 이상 장애물 무시      |
+| `Grid/MaxGroundHeight`   | `0.15` | 바닥 판정 최대 15cm        |
+| `Optimizer/GravitySigma` | `0.3`  | IMU gravity constraint     |
+| `Odom/AlignWithGround`   | `true` | IMU 기반 중력 정렬         |
+| `Reg/Strategy`           | `0`    | Visual registration        |
+| `Vis/MinInliers`         | `15`   | 최소 inlier 수             |
 
 ---
 
@@ -248,13 +248,13 @@ python test_client.py
 
 ### 우리가 수정/추가한 파일
 
-| 파일                                           | 내용                                             |
-| ---------------------------------------------- | ------------------------------------------------ |
-| `guilib/include/rtabmap/gui/GridTcpStreamer.h`  | **신규** — TCP 서버 클래스 (QTcpServer 기반)     |
-| `guilib/src/GridTcpStreamer.cpp`                | **신규** — 구현 (멀티 클라이언트, 10Hz rate limit) |
-| `guilib/include/rtabmap/gui/MainWindow.h`       | 수정 — 멤버 변수, 슬롯, getCustomParameters 선언 |
-| `guilib/src/MainWindow.cpp`                     | 수정 — TCP 통합, D455f 파라미터, Graph View 기본 |
-| `guilib/src/CMakeLists.txt`                     | 수정 — GridTcpStreamer 등록 + Qt6::Network 추가  |
+| 파일                                           | 내용                                               |
+| ---------------------------------------------- | -------------------------------------------------- |
+| `guilib/include/rtabmap/gui/GridTcpStreamer.h` | **신규** — TCP 서버 클래스 (QTcpServer 기반)       |
+| `guilib/src/GridTcpStreamer.cpp`               | **신규** — 구현 (멀티 클라이언트, 10Hz rate limit) |
+| `guilib/include/rtabmap/gui/MainWindow.h`      | 수정 — 멤버 변수, 슬롯, getCustomParameters 선언   |
+| `guilib/src/MainWindow.cpp`                    | 수정 — TCP 통합, D455f 파라미터, Graph View 기본   |
+| `guilib/src/CMakeLists.txt`                    | 수정 — GridTcpStreamer 등록 + Qt6::Network 추가    |
 
 ### 빠른 재빌드 (GUI만)
 
