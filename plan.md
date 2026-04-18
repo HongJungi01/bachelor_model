@@ -1,69 +1,57 @@
 # Plan: RealSense D455f → RTAB-Map SLAM → 2D Occupancy Grid + 시각화 실시간 파이프라인
 
-> **내 담당 범위**: RealSense D455f 캡처 → RTAB-Map SLAM 매핑 → 2D occupancy grid 변환 + OpenCV 시각화 → TCP로 같은 PC의 Unity에 실시간 전달
-> **현재 상태**: 빌드 미완, RealSense D455f 보유(미테스트), 커스텀 C++ 코드 작성 완료
+> **내 담당 범위**: RealSense D455f 캡처 → RTAB-Map SLAM 매핑 → 2D occupancy grid 변환 + GUI 시각화 → TCP로 같은 PC의 Unity에 실시간 전달
+> **현재 상태**: Windows 네이티브 빌드 완료 ✅, RTAB-Map GUI + TCP 스트리밍 통합 완료
 > **카메라**: Intel RealSense D455f (내장 6축 IMU, USB 3.0, 유효 depth 0.3–6.0m, 1280×720@30fps)
+> **접근 방식**: RTAB-Map 소스 직접 수정 — GUI 기반 (3D Map + 2D Grid + Loop Closure + Odometry 패널 활용)
+> **향후 확장**: Semantic SLAM (LLM/VLM) — 확정 시 별도 작업
 
 ---
 
 ## 내가 할 일 — 단계별 체크리스트
 
-### Step 0. 환경 구축
+### Step 0-W. Windows 네이티브 GUI 빌드 (현재 방식)
 
-- [x] **0-1. Visual Studio 2022 설치** ✅ (Windows 빌드 포기, WSL2로 전환)
+> WSL2 headless 빌드에서 **Windows 네이티브 GUI 빌드**로 전환.
+> RTAB-Map 소스를 직접 수정하여 TCP 스트리밍 기능을 GUI에 통합.
 
-- [x] **0-2. WSL2 Ubuntu 22.04 설치** ✅ 완료
-  - VirtualMachinePlatform + WSL 기능 활성화 → 재부팅 → Ubuntu-22.04 설치
-  - 사용자: `dev` / 비밀번호: `1234` / NOPASSWD sudo
-  - 커널: 6.6.87.2-microsoft-standard-WSL2
+- [x] **0-W-1. VS2022 + CMake 확인** ✅
+  - Visual Studio 2022 Community (MSVC 19.44)
+  - CMake 3.31.6-msvc6 (VS 번들)
+  - Windows SDK 10.0.26100.0
 
-- [x] **0-3. WSL2에서 RTAB-Map 소스 빌드** ✅ 완료
-  - apt 의존성 695패키지 설치 (OpenCV 4.5.4, PCL 1.12.1, Boost 1.74)
-  - **librealsense2 2.57.7**: 소스 빌드 with `-DFORCE_RSUSB_BACKEND=ON` (WSL2 UVC 모듈 없음)
-  - RTAB-Map 0.23.4: RealSense2=YES, OctoMap=YES, Qt=OFF → `/usr/local` 설치
-  - 커스텀 파이프라인: `~/dev/rtabmap_2d_pipeline/build/rtabmap_2d_pipeline`
+- [x] **0-W-2. vcpkg 사전빌드 의존성 설치** ✅
+  - RTAB-Map 공식 릴리스 첨부: `vcpkg-export-66c0373d-x64-vs2022.7z`
+  - 추출 위치: `C:\dev\vcpkg_export\installed\x64-windows-release\`
+  - 주요 라이브러리: Qt 6.10.0, VTK 9.3, PCL 1.15.1, OpenCV 4.12.0
 
-  ```bash
-  # librealsense RSUSB 빌드 (WSL2 전용 — V4L2 불가)
-  cd ~/librealsense/build
-  cmake .. -DCMAKE_BUILD_TYPE=Release -DFORCE_RSUSB_BACKEND=ON \
-    -DBUILD_EXAMPLES=OFF -DBUILD_GRAPHICAL_EXAMPLES=OFF
-  make -j4 && sudo make install
-
-  # RTAB-Map 빌드
-  cd ~/dev/rtabmap/build
-  cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_QT=OFF -DWITH_REALSENSE2=ON \
-    -DBUILD_APP=OFF -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF
-  make -j4 && sudo make install
-
-  # 파이프라인 빌드
-  cd ~/dev/rtabmap_2d_pipeline/build
-  cmake .. && make -j4
-  ```
-
-- [x] **0-4. RealSense USB passthrough (usbipd-win)** ✅ 완료
-  - usbipd-win 5.3.0 설치, linux-tools-generic + hwdata 설치
-  - RealSense D455F: BUSID **5-3** (8086:0b5c), USB 3.2
-  - ⚠️ USB 권한: 매번 `sudo chmod 666 /dev/bus/usb/002/*` 필요 (udev 미작동)
+- [x] **0-W-3. RTAB-Map 빌드 (WITH_QT=ON)** ✅
 
   ```powershell
-  # Windows: WSL 시작 후 attach
-  wsl -d Ubuntu-22.04 -u dev -- bash -c "sleep 120" &
-  usbipd bind --busid 5-3   # 최초 1회
-  usbipd attach --wsl --busid 5-3
+  cd C:\dev\rtabmap\build
+  cmake .. -Wno-dev  # CMake 캐시에 vcpkg 경로 등 설정 완료
+  cmake --build . --config Release --parallel
   ```
 
-  ```bash
-  # WSL2: USB 권한 설정 + 실행
-  sudo chmod 666 /dev/bus/usb/002/*
-  cd ~/dev/rtabmap_2d_pipeline/build
-  ./rtabmap_2d_pipeline
-  ```
+  - 빌드 결과: `C:\dev\rtabmap\build\bin\RTABMap.exe`
+  - 주요 옵션: WITH_QT=ON, BUILD_APP=ON, WITH_REALSENSE2=ON
 
-- [x] **0-5. 파이프라인 단독 실행 확인** ✅ 완료 (Qt GUI 없이 직접 테스트)
-  - RealSense D455F 감지: S/N 254122300022, FW 5.15.1.55, IMU BMI085
-  - Odometry: ~30fps, lost=false, features 300-730, inliers 90-165
-  - ⚠️ IMU orientation 미설정 경고 → visual odometry만 사용 중 (정상 동작)
+- [x] **0-W-4. RTAB-Map 소스 수정 — TCP Grid Streaming** ✅
+  - **새 파일**: `guilib/include/rtabmap/gui/GridTcpStreamer.h` — Qt TCP 서버
+  - **새 파일**: `guilib/src/GridTcpStreamer.cpp` — 구현 (멀티 클라이언트, 10Hz 제한)
+  - **수정**: `guilib/include/rtabmap/gui/MainWindow.h` — 멤버/슬롯 추가
+  - **수정**: `guilib/src/MainWindow.cpp` — TCP 스트리밍 통합 (Tools 메뉴)
+  - **수정**: `guilib/src/CMakeLists.txt` — GridTcpStreamer + Qt6::Network
+
+- [x] **0-W-5. D455f 최적 파라미터 하드코딩** ✅
+  - `MainWindow::getCustomParameters()` 오버라이드
+  - Grid, Optimizer, Odometry 파라미터 자동 적용 (Start 시)
+
+- [x] **0-W-6. Graph View (2D Grid) 기본 표시** ✅
+  - `setDefaultViews()`에서 `dockWidget_graphViewer->setVisible(true)` 변경
+
+- [x] **0-W-7. GUI 실행 확인** ✅
+  - RTABMap.exe 정상 실행, 크래시 없음
 
 ### Step 1. Grid 파라미터 튜닝
 
@@ -181,30 +169,24 @@
 
 ## 참고: 시스템 아키텍처
 
-### 전체 데이터 흐름
+### 전체 데이터 흐름 (Windows 네이티브 GUI)
 
 ```
-RealSense D4xx (USB3, 30fps)
+RealSense D455f (USB3, 30fps)
      │
      ▼
 SensorCaptureThread ──SensorEvent──▶ OdometryThread ──OdometryEvent──▶ RtabmapThread
 (RGBD 프레임 캡처)                  (프레임간 pose 추정)              (매핑 + 루프클로저)
                                                                            │
-                                                                           ▼
-                                                                     RtabmapEvent
-                                                                   (Statistics 포함)
-                                                                           │
-                                                                           ▼
-                                                                    GridPublisher
-                                                                  (2D grid 추출 + 전송)
-                                                                      │         │
-                                                                      ▼         ▼
-                                                                 TCP 소켓    파일 출력
-                                                              (localhost:7777) (PGM+YAML)
-                                                                      │
-                                                                      ▼
-                                                                Unity (경로계획)
-                                                                → HENES 차량 제어
+                                                                    ┌──────┴──────┐
+                                                                    ▼             ▼
+                                                             MainWindow    GridTcpStreamer
+                                                          (Qt GUI 패널)   (TCP port 7777)
+                                                                               │
+                                                          3D CloudViewer       ▼
+                                                          2D GraphViewer    Unity (경로계획)
+                                                          Loop Closure      → HENES 차량 제어
+                                                          Odometry View
 ```
 
 ### RTAB-Map 내부 3D→2D 변환 과정
@@ -287,16 +269,11 @@ cv::Mat (CV_8S) — 2D Occupancy Grid
 
 | 날짜       | 결정 사항                                   | 근거                                                                         |
 | ---------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
-| 2026-04-15 | 커스텀 C++ 코드 작성 (기존 도구만으로 부족) | RTAB-Map GUI는 grid TCP 출력 미지원, 실시간 스트리밍 필요                    |
 | 2026-04-15 | TCP 소켓 확정, 공유 메모리 검토 중          | 같은 PC 내 Unity 연동, 공유 메모리는 성능 이점 있으나 복잡도↑                |
 | 2026-04-15 | 실시간 필수 (후처리 불가)                   | 차량이 주행 중 경로계획에 grid 필요                                          |
-| 2026-04-18 | librealsense RSUSB 백엔드 소스 빌드         | WSL2 커널에 uvcvideo 모듈 없음 → V4L2 불가 → FORCE_RSUSB_BACKEND=ON          |
-| 2026-04-18 | USB 권한: 수동 chmod 666 (udev 미작동)      | WSL2에서 udevd 미실행, 매 attach 시 `sudo chmod 666 /dev/bus/usb/002/*` 필요 |
-| 2026-04-18 | make -j4 (nproc 대신)                       | WSL2 메모리 제한으로 -j$(nproc) 시 OOM kill 발생                             |
-| 2026-04-15 | RGBDMapping 예제 기반 확정                  | MapBuilder.h에 2D grid 추출 패턴이 이미 구현되어 있음                        |
 | 2026-04-17 | D455f 전용 파라미터 추가                    | 내장 IMU 활용: GravitySigma=0.3, AlignWithGround=true                        |
-| 2026-04-17 | OpenCV 시각화 추가 (Qt 불필요)              | convertMap2Image8U() + imshow로 동작 확인, GUI 의존성 제거                   |
-| 2026-04-17 | 커스텀 코드 4개 파일 작성 완료              | main.cpp, GridPublisher.h, CMakeLists.txt, test_client.py                    |
-| 2026-04-18 | Windows 빌드 포기 → WSL2 전환               | CMake 3.31 libarchive tar 버그 + MAX_PATH 문제 → vcpkg 빌드 불가             |
-| 2026-04-18 | Ubuntu 22.04 (Jammy) 선택                   | RTAB-Map Docker 레시피 Jammy 기반, librealsense2 apt 패키지 지원             |
-| 2026-04-18 | GridPublisher.h Linux 헤더 수정             | fcntl.h, sys/stat.h 추가 (fcntl(), mkdir() POSIX 함수용)                     |
+| 2026-04-20 | **WSL2 → Windows 네이티브 GUI로 전환**      | vcpkg 사전빌드 export로 libarchive 버그 우회, GUI(3D+2D+LoopClosure) 활용    |
+| 2026-04-20 | RTAB-Map 소스 직접 수정 방식 채택           | GUI 기능 활용 + TCP 스트리밍 통합, 별도 바이너리 불필요                      |
+| 2026-04-20 | GridTcpStreamer 클래스 추가 (guilib)        | MainWindow에 TCP 서버 통합, Tools 메뉴에서 on/off                            |
+| 2026-04-20 | getCustomParameters()에 D455f 파라미터      | Start 시 자동 적용, Preferences 대화상자보다 우선                            |
+| 2026-04-20 | Graph View 기본 표시                        | 2D Grid(점유 그리드) 패널을 기본으로 표시하여 즉시 확인 가능                 |

@@ -55,6 +55,7 @@ class IMUThread;
 class CloudViewer;
 class LoopClosureViewer;
 class OccupancyGrid;
+class GridTcpStreamer;
 }
 
 class QGraphicsScene;
@@ -241,6 +242,10 @@ protected Q_SLOTS:
 	void updateNodeVisibility(int, bool);
 	void updateGraphView();
 
+	// TCP Grid Streaming
+	void toggleTcpGridStreaming(bool enabled);
+	void onTcpStatusMessage(const QString & msg);
+
 Q_SIGNALS:
 	void statsReceived(const rtabmap::Statistics &);
 	void statsProcessed();
@@ -318,7 +323,7 @@ protected:
 	void setNewDatabasePathOutput(const QString & newDatabasePathOutput) {_newDatabasePathOutput = newDatabasePathOutput;}
 	const QString & newDatabasePathOutput() const { return _newDatabasePathOutput; }
 
-	virtual ParametersMap getCustomParameters() {return ParametersMap();}
+	virtual ParametersMap getCustomParameters();
 
 	void postProcessing(
 			bool refineNeighborLinks,
@@ -431,6 +436,10 @@ private:
 
 	bool _firstCall;
 	bool _progressCanceled;
+
+	// TCP Grid Streaming
+	GridTcpStreamer * _gridTcpStreamer;
+	QAction * _actionTcpGridStreaming;
 };
 
 }

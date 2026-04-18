@@ -1,497 +1,364 @@
-# WSL2 빌드 & 세팅 가이드
+# 빌드 & 실행 가이드
 
-> RealSense D455f → RTAB-Map SLAM → 2D Occupancy Grid 파이프라인
+> RealSense D455f → RTAB-Map SLAM → 2D Occupancy Grid → TCP 스트리밍 (Unity)
 >
-> 작성일: 2026-04-18 | OS: Windows + WSL2 Ubuntu 22.04 (Jammy)
+> OS: Windows 10/11 | 빌드: Visual Studio 2022 + CMake
 
 ---
 
 ## 목차
 
 1. [사전 조건](#1-사전-조건)
-2. [WSL2 설치 및 설정](#2-wsl2-설치-및-설정)
-3. [소스코드 복사](#3-소스코드-복사)
-4. [apt 의존성 설치](#4-apt-의존성-설치)
-5. [librealsense2 소스 빌드 (RSUSB 백엔드)](#5-librealsense2-소스-빌드-rsusb-백엔드)
-6. [RTAB-Map 빌드](#6-rtab-map-빌드)
-7. [커스텀 파이프라인 빌드](#7-커스텀-파이프라인-빌드)
-8. [RealSense USB Passthrough (usbipd-win)](#8-realsense-usb-passthrough-usbipd-win)
-9. [파이프라인 실행](#9-파이프라인-실행)
-10. [트러블슈팅](#10-트러블슈팅)
-11. [최종 환경 요약](#11-최종-환경-요약)
+2. [vcpkg 의존성 설치](#2-vcpkg-의존성-설치)
+3. [RTAB-Map 소스 빌드](#3-rtab-map-소스-빌드)
+4. [실행](#4-실행)
+5. [카메라 연결 & SLAM 시작](#5-카메라-연결--slam-시작)
+6. [TCP Grid Streaming (Unity 연동)](#6-tcp-grid-streaming-unity-연동)
+7. [소스 수정 & 재빌드](#7-소스-수정--재빌드)
+8. [트러블슈팅](#8-트러블슈팅)
+9. [프로젝트 구조](#9-프로젝트-구조)
 
 ---
 
 ## 1. 사전 조건
 
-| 항목    | 버전/사양                                      |
-| ------- | ---------------------------------------------- |
-| Windows | 10/11, 빌드 19041 이상                         |
-| 카메라  | Intel RealSense D455f (USB 3.0 이상 포트 필수) |
-| RAM     | 8GB+ 권장 (WSL2에 4GB 이상 할당)               |
-| 디스크  | WSL2에 ~10GB 여유 공간                         |
+| 항목            | 버전/사양                         | 설치 방법                          |
+| --------------- | --------------------------------- | ---------------------------------- |
+| Visual Studio   | 2022 Community (MSVC 19.44+)      | [visualstudio.com](https://visualstudio.microsoft.com/) |
+| C++ 워크로드    | "C++를 사용한 데스크톱 개발"       | VS Installer에서 체크              |
+| Windows SDK     | 10.0.22621.0 이상                 | VS Installer에 포함                |
+| 7-Zip           | 최신                              | `choco install 7zip -y`           |
+| Git             | 최신                              | `winget install Git.Git`          |
+| 카메라          | Intel RealSense D455f (USB 3.0)   | USB 3.0 포트에 직접 연결          |
 
-### 왜 WSL2인가? (Windows 네이티브 빌드 포기 이유)
-
-- CMake 3.31의 libarchive regression 버그로 vcpkg tar 추출 실패 (`Invalid empty pathname`)
-- Windows MAX_PATH 제한으로 qtdeclarative 등 긴 경로 패키지 빌드 불가
-- WSL2 Ubuntu에서는 apt로 의존성 설치가 간단하고 안정적
+> **CMake**는 VS2022에 번들 포함되어 있어 별도 설치 불필요.
 
 ---
 
-## 2. WSL2 설치 및 설정
+## 2. vcpkg 의존성 설치
 
-### 2-1. Windows 기능 활성화 (관리자 PowerShell)
+RTAB-Map 공식 릴리스에서 사전빌드된 vcpkg export를 다운로드한다.
 
 ```powershell
-# WSL 및 가상화 기능 활성화
-dism.exe /online /enable-feature /featurename:Microsoft-Windows-Subsystem-Linux /all /norestart
-dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+cd C:\dev
 
-# ⚠️ 재부팅 필요
-Restart-Computer
+# 다운로드 (~2.5GB)
+$url = "https://github.com/introlab/rtabmap/releases/download/0.23.1/vcpkg-export-66c0373d-x64-vs2022.7z"
+Invoke-WebRequest -Uri $url -OutFile "vcpkg_export.7z"
+
+# 압축 해제
+& "C:\Program Files\7-Zip\7z.exe" x "vcpkg_export.7z" -o"C:\dev\vcpkg_export" -y
 ```
 
-### 2-2. Ubuntu 22.04 설치 (재부팅 후)
+압축 해제 후 `C:\dev\vcpkg_export\installed\x64-windows-release\` 에 라이브러리 설치됨:
+
+| 라이브러리     | 버전    |
+| -------------- | ------- |
+| Qt             | 6.10.0  |
+| VTK            | 9.3     |
+| PCL            | 1.15.1  |
+| OpenCV         | 4.12.0  |
+| librealsense   | 2.56.2  |
+| g2o, Eigen, Boost | 최신 |
+
+---
+
+## 3. RTAB-Map 소스 빌드
+
+### 3-1. 소스 가져오기
 
 ```powershell
-wsl --install Ubuntu-22.04
+cd C:\dev
+git clone <이 레포 URL> .
+# 또는 이미 있으면:
+# git pull
 ```
 
-설치 중 UNIX 사용자명/비밀번호 설정 프롬프트가 나타남:
-
-- 사용자명: `dev`
-- 비밀번호: `1234` (개발용)
-
-### 2-3. NOPASSWD sudo 설정
+### 3-2. CMake 구성
 
 ```powershell
-# Windows에서 WSL 쉘 진입 후 설정
-wsl -d Ubuntu-22.04 -u root -- bash -c "cat > /etc/wsl.conf << 'EOF'
-[user]
-default=dev
-EOF
-usermod -aG sudo dev
-echo 'dev ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/dev
-chmod 440 /etc/sudoers.d/dev"
+$cmakeBin = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+$vcpkg = "C:\dev\vcpkg_export\installed\x64-windows-release"
+$psapi = "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64\psapi.lib"
 
-# WSL 재시작으로 wsl.conf 적용
-wsl --terminate Ubuntu-22.04
+cd C:\dev\rtabmap
+New-Item -ItemType Directory -Force -Path build
+cd build
+
+& $cmakeBin .. `
+  -Wno-dev `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_PREFIX_PATH="$vcpkg" `
+  -DCMAKE_INSTALL_PREFIX="C:\dev\rtabmap\install" `
+  -DWITH_QT=ON `
+  -DBUILD_APP=ON `
+  -DWITH_REALSENSE2=ON `
+  -DBUILD_TOOLS=ON `
+  -DBUILD_EXAMPLES=OFF `
+  -DPSAPI_LIBRARIES="$psapi"
 ```
 
----
+> ⚠️ `$psapi` 경로의 Windows SDK 버전(`10.0.26100.0`)은 본인 환경에 맞게 수정.
+> 확인: `Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" | Select-Object Name`
 
-## 3. 소스코드 복사
-
-Windows 소스(`C:\dev\`)를 WSL2 네이티브 파일시스템으로 복사한다.
-`/mnt/c/` 경로는 9p 마운트라 빌드 속도가 극도로 느리므로 반드시 `~/dev/`로 복사.
-
-```bash
-# WSL2 내부에서 실행
-mkdir -p ~/dev
-
-# vcpkg 제외하고 복사 (Windows vcpkg는 불필요, 매우 크기 때문)
-rsync -a --exclude='vcpkg/' --exclude='build/' /mnt/c/dev/rtabmap ~/dev/
-rsync -a /mnt/c/dev/rtabmap_2d_pipeline ~/dev/
-```
-
----
-
-## 4. apt 의존성 설치
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  build-essential cmake git \
-  libsqlite3-dev libfmt-dev \
-  libopencv-dev \
-  libpcl-dev \
-  libboost-all-dev \
-  libeigen3-dev \
-  liboctomap-dev \
-  libgtsam-dev \
-  libg2o-dev \
-  libusb-1.0-0-dev \
-  pkg-config
-```
-
-> 총 약 695개 패키지가 설치됨. 주요 버전:
->
-> - OpenCV 4.5.4
-> - PCL 1.12.1
-> - Boost 1.74
-> - CMake 3.22
-
----
-
-## 5. librealsense2 소스 빌드 (RSUSB 백엔드)
-
-### 왜 소스 빌드인가?
-
-- Intel apt 저장소의 librealsense2는 **V4L2 (UVC) 백엔드**만 지원
-- WSL2 커널(6.6.87.2-microsoft)에는 `uvcvideo` 커널 모듈이 **없음**
-- 따라서 `FORCE_RSUSB_BACKEND=ON`으로 **libusb 직접 접근** 백엔드로 빌드해야 함
-
-### 5-1. 소스 클론
-
-```bash
-cd ~
-git clone --depth 1 --branch v2.57.7 https://github.com/IntelRealSense/librealsense.git
-```
-
-### 5-2. 빌드 & 설치
-
-```bash
-cd ~/librealsense
-mkdir build && cd build
-
-cmake .. \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DFORCE_RSUSB_BACKEND=ON \
-  -DBUILD_EXAMPLES=OFF \
-  -DBUILD_GRAPHICAL_EXAMPLES=OFF \
-  -DBUILD_WITH_OPENMP=ON \
-  -DCMAKE_INSTALL_PREFIX=/usr/local
-
-make -j4
-sudo make install
-sudo ldconfig
-```
-
-> ⚠️ `make -j$(nproc)` 대신 **`make -j4`** 사용.
-> WSL2 기본 메모리 제한에서 병렬 수가 너무 많으면 OOM kill 발생.
-
-### 5-3. udev 규칙 복사 (참고용)
-
-```bash
-sudo cp ~/librealsense/config/99-realsense-libusb.rules /etc/udev/rules.d/
-```
-
-> WSL2에서는 udevd가 실행되지 않아 실제 효과는 없음.
-> USB 권한은 매번 수동으로 설정해야 함 (섹션 9 참조).
-
-### 5-4. 설치 확인
-
-```bash
-rs-enumerate-devices 2>&1 | head -5
-# → "No device detected" (카메라 미연결 상태면 정상)
-# → Device info가 뜨면 성공
-```
-
----
-
-## 6. RTAB-Map 빌드
-
-### 6-1. CMake 구성
-
-```bash
-cd ~/dev/rtabmap
-mkdir -p build && cd build
-
-cmake .. \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DWITH_QT=OFF \
-  -DWITH_REALSENSE2=ON \
-  -DBUILD_APP=OFF \
-  -DBUILD_TOOLS=OFF \
-  -DBUILD_EXAMPLES=OFF
-```
-
-CMake 출력에서 확인할 핵심 항목:
+CMake 출력에서 확인할 항목:
 
 ```
---   With RealSense2 2.57.7    = YES
---   With OctoMap               = YES
+--   With RealSense2  = YES
+--   With Qt (Qt6)    = YES
+--   With VTK         = YES
 ```
 
-### 6-2. 빌드 & 설치
-
-```bash
-make -j4
-sudo make install
-sudo ldconfig
-```
-
-### 6-3. 설치 확인
-
-```bash
-ls /usr/local/lib/librtabmap_core.so
-# → 파일 존재 확인
-
-pkg-config --modversion rtabmap
-# → 0.23.4
-```
-
----
-
-## 7. 커스텀 파이프라인 빌드
-
-```bash
-cd ~/dev/rtabmap_2d_pipeline
-mkdir -p build && cd build
-
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j4
-```
-
-### 링크 확인
-
-```bash
-ldd ./rtabmap_2d_pipeline | grep -E "rtabmap|realsense|opencv"
-```
-
-기대 출력:
-
-```
-librealsense2.so.2.57    => /usr/local/lib/librealsense2.so.2.57
-librtabmap_core.so.0.23  => /usr/local/lib/librtabmap_core.so.0.23
-librtabmap_utilite.so.0.23 => /usr/local/lib/librtabmap_utilite.so.0.23
-libopencv_core.so.4.5    => /usr/lib/x86_64-linux-gnu/libopencv_core.so.4.5
-```
-
-> `/usr/local/lib`의 librealsense (RSUSB 백엔드)에 링크되어야 함.
-> `/usr/lib/`의 apt 버전(V4L2)에 링크되면 카메라 인식 안 됨.
-
----
-
-## 8. RealSense USB Passthrough (usbipd-win)
-
-WSL2는 USB 장치에 직접 접근 불가. `usbipd-win`으로 Windows USB를 WSL2에 전달해야 함.
-
-### 8-1. Windows 측 설치
+### 3-3. 빌드
 
 ```powershell
-# 관리자 PowerShell
-winget install --exact dorssel.usbipd-win
+& $cmakeBin --build . --config Release --parallel
 ```
 
-> 설치 버전: 5.3.0
+> 첫 빌드: 약 5~10분 소요 (CPU에 따라 다름)
 
-### 8-2. WSL2 측 설치
+빌드 완료 시:
 
-```bash
-sudo apt-get install -y linux-tools-generic hwdata
+```
+rtabmap_app.vcxproj -> C:\dev\rtabmap\build\bin\RTABMap.exe
 ```
 
-> WSL2 커널(6.6.x)과 linux-tools(5.15.x) 버전 불일치 경고가 나오지만,
-> usbipd-win이 `vhci_hcd` 모듈을 자동 로드하므로 실제 동작에 문제없음.
+---
 
-### 8-3. RealSense 연결 및 확인
+## 4. 실행
 
-1. RealSense D455f를 **PC 본체 USB 3.0 포트에 직접 연결** (허브 사용 금지)
-2. Windows에서 장치 확인:
+### 방법 A: 배치 파일 (추천)
 
 ```powershell
-usbipd list
+C:\dev\run_rtabmap.bat
 ```
 
-```
-BUSID  VID:PID    DEVICE                                                        STATE
-5-3    8086:0b5c  Intel(R) RealSense(TM) Depth Camera 455f Depth, Intel(R) ...  Not shared
-```
+더블클릭 또는 PowerShell에서 실행.
 
-> ⚠️ **RealSense가 목록에 안 나타나는 경우**:
->
-> - 케이블을 뺐다가 다시 꽂기 (접촉 불량)
-> - 다른 USB 3.0 포트 시도
-> - `pnputil /enum-devices /connected /class "USB"`로 연결 상태 확인
-> - "연결 끊김" 상태면 물리적으로 재연결 필요
-
-### 8-4. WSL2에 USB 장치 전달
+### 방법 B: PowerShell 직접 실행
 
 ```powershell
-# (1) WSL2가 실행 중이어야 함 — 별도 터미널에서 WSL 세션 열어두기
-wsl -d Ubuntu-22.04
-
-# (2) 최초 1회: 장치 공유 등록 (관리자 권한 필요)
-usbipd bind --busid 5-3
-
-# (3) WSL2에 연결 (관리자 권한 필요)
-usbipd attach --wsl --busid 5-3
+$env:PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\bin;C:\dev\rtabmap\build\bin;$env:PATH"
+$env:QT_PLUGIN_PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\Qt6\plugins"
+& "C:\dev\rtabmap\build\bin\RTABMap.exe"
 ```
 
-정상 출력:
+### GUI 패널 구성
+
+| 패널              | 내용                          |
+| ----------------- | ----------------------------- |
+| 3D Map            | 3D 포인트클라우드 + 카메라 경로 |
+| Graph View        | **2D Occupancy Grid** (점유 그리드) |
+| Loop Closure      | 루프 클로저 탐지 시각화        |
+| Odometry          | 프레임간 특징점 매칭           |
+
+---
+
+## 5. 카메라 연결 & SLAM 시작
+
+1. RealSense D455f를 **PC USB 3.0 포트에 직접 연결** (허브 사용 금지)
+2. RTABMap 실행
+3. **Edit → Preferences → Source type** 섹션:
+   - Camera → `RealSense2` 선택
+   - OK
+4. **Detection → Start (▶)** 클릭
+5. 카메라를 들고 천천히 이동 → 3D Map + 2D Grid 실시간 생성
+
+### 자동 적용되는 D455f 최적 파라미터
+
+Start 시 `getCustomParameters()`에서 자동 적용됨 (별도 설정 불필요):
+
+| 파라미터                   | 값     | 의미                         |
+| -------------------------- | ------ | ---------------------------- |
+| `Grid/CellSize`            | `0.05` | 5cm 해상도                   |
+| `Grid/RangeMax`            | `6.0`  | D455f depth 상한 6m          |
+| `Grid/RangeMin`            | `0.3`  | D455f depth 하한 0.3m        |
+| `Grid/RayTracing`          | `true` | 센서~장애물 사이 free 마킹   |
+| `Grid/DepthDecimation`     | `2`    | 해상도 2배 축소 (성능)       |
+| `Grid/MaxObstacleHeight`   | `1.5`  | 1.5m 이상 장애물 무시        |
+| `Grid/MaxGroundHeight`     | `0.15` | 바닥 판정 최대 15cm          |
+| `Optimizer/GravitySigma`   | `0.3`  | IMU gravity constraint       |
+| `Odom/AlignWithGround`     | `true` | IMU 기반 중력 정렬           |
+| `Reg/Strategy`             | `0`    | Visual registration          |
+| `Vis/MinInliers`           | `15`   | 최소 inlier 수               |
+
+---
+
+## 6. TCP Grid Streaming (Unity 연동)
+
+### 활성화
+
+1. RTABMap GUI에서 **Tools → TCP Grid Streaming (port 7777)** 체크
+2. 상태바에 "TCP Grid Streaming: listening on port 7777" 표시
+3. Start(▶)로 SLAM 시작 → 클라이언트에 자동 전송 (10Hz)
+
+### 패킷 프로토콜 (little-endian)
 
 ```
-usbipd: info: Using WSL distribution 'Ubuntu-22.04' to attach; the device will be available in all WSL 2 distributions.
-usbipd: info: Loading vhci_hcd module.
-usbipd: info: Detected networking mode 'nat'.
-usbipd: info: Using IP address 172.19.0.1 to reach the host.
+[Header 32 bytes]
+  int32  width       — 그리드 가로 셀 수
+  int32  height      — 그리드 세로 셀 수
+  float  xMin        — 왼쪽 하단 X좌표 (m)
+  float  yMin        — 왼쪽 하단 Y좌표 (m)
+  float  cellSize    — 셀 크기 (m, 기본 0.05)
+  float  poseX       — 로봇 X좌표 (m)
+  float  poseY       — 로봇 Y좌표 (m)
+  float  poseYaw     — 로봇 방향 (rad)
+
+[Body: width × height bytes]
+  int8 per cell: -1=unknown, 0=free, 100=obstacle
 ```
 
-### 8-5. WSL2에서 장치 확인
+### 좌표 변환
 
-```bash
-lsusb
-# Bus 002 Device 002: ID 8086:0b5c Intel Corp. Intel(R) RealSense(TM) Depth Camera 455f
+```
+gridX = (poseX - xMin) / cellSize
+gridY = (poseY - yMin) / cellSize
+```
+
+### Unity C# 예시
+
+```csharp
+TcpClient client = new TcpClient("127.0.0.1", 7777);
+NetworkStream stream = client.GetStream();
+
+byte[] header = new byte[32];
+stream.Read(header, 0, 32);
+
+int width  = BitConverter.ToInt32(header, 0);
+int height = BitConverter.ToInt32(header, 4);
+float xMin = BitConverter.ToSingle(header, 8);
+// ...
+
+byte[] body = new byte[width * height];
+stream.Read(body, 0, body.Length);
+// body[i]: -1=unknown, 0=free, 100=obstacle
+```
+
+### Python 테스트
+
+```powershell
+cd C:\dev\rtabmap_2d_pipeline
+python test_client.py
 ```
 
 ---
 
-## 9. 파이프라인 실행
+## 7. 소스 수정 & 재빌드
 
-### 매번 실행 시 순서
+### 우리가 수정/추가한 파일
 
-```bash
-# ① USB 장치 권한 설정 (WSL2에서 udev 미작동, 매 attach 마다 필요)
-sudo chmod 666 /dev/bus/usb/002/*
+| 파일                                           | 내용                                             |
+| ---------------------------------------------- | ------------------------------------------------ |
+| `guilib/include/rtabmap/gui/GridTcpStreamer.h`  | **신규** — TCP 서버 클래스 (QTcpServer 기반)     |
+| `guilib/src/GridTcpStreamer.cpp`                | **신규** — 구현 (멀티 클라이언트, 10Hz rate limit) |
+| `guilib/include/rtabmap/gui/MainWindow.h`       | 수정 — 멤버 변수, 슬롯, getCustomParameters 선언 |
+| `guilib/src/MainWindow.cpp`                     | 수정 — TCP 통합, D455f 파라미터, Graph View 기본 |
+| `guilib/src/CMakeLists.txt`                     | 수정 — GridTcpStreamer 등록 + Qt6::Network 추가  |
 
-# ② output 디렉토리 생성
-mkdir -p ~/dev/rtabmap_2d_pipeline/build/output
+### 빠른 재빌드 (GUI만)
 
-# ③ 파이프라인 실행
-cd ~/dev/rtabmap_2d_pipeline/build
-./rtabmap_2d_pipeline
+```powershell
+$cmakeBin = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+cd C:\dev\rtabmap\build
+
+# GUI 라이브러리만 재빌드 (~30초)
+& $cmakeBin --build . --config Release --target rtabmap_gui --parallel
+
+# 앱도 재빌드 (~10초)
+& $cmakeBin --build . --config Release --target rtabmap_app --parallel
 ```
 
-### 정상 동작 시 출력 예시
+### 새 소스 파일 추가 시
 
-```
-[INFO] CameraRealSense2.cpp:528::init() Device "Intel RealSense D455F" with serial number 254122300022
-[INFO] CameraRealSense2.cpp:624::init() Using device with Serial No: 254122300022
-[INFO] CameraRealSense2.cpp:630::init() Device FW version: 5.15.1.55
-[INFO] CameraRealSense2.cpp:715::init() Stereo Module was found.
-[INFO] CameraRealSense2.cpp:715::init() RGB Camera was found.
-[INFO] CameraRealSense2.cpp:715::init() Motion Module was found.
-=== RTAB-Map 2D Pipeline running ===
-  Camera : RealSense D455f
-  TCP    : 127.0.0.1:7777
-  Output : output/map.pgm + map.yaml
-  Press Ctrl+C to stop.
+1. `guilib/src/CMakeLists.txt` 에 헤더/소스 등록
+2. CMake 재구성 + 전체 빌드:
 
-[INFO] OdometryF2M.cpp:1569::computeTransform() Odom update time = 0.032s lost=false features=709 inliers=150/362
-```
-
-### 알려진 경고 (무시 가능)
-
-```
-[ERROR] (context.cpp:41) No valid configuration file found at : /home/dev/.realsense-config.json loading defaults
-```
-
-→ RealSense 설정 파일 없음. 기본값 사용, 정상 동작.
-
-```
-[WARN] Odometry.cpp:346::process() Received IMU doesn't have orientation set! It is ignored.
-```
-
-→ IMU orientation fusion이 안 되어 무시됨. Visual Odometry만으로 정상 추적.
-
-### 종료
-
-`Ctrl+C` → 정상 shutdown, `rtabmap.db` 저장됨.
-
----
-
-## 10. 트러블슈팅
-
-### usbipd list에 RealSense가 안 보임
-
-| 원인                | 해결                              |
-| ------------------- | --------------------------------- |
-| 케이블 접촉 불량    | USB 케이블을 뽑고 다시 꽂기       |
-| USB 2.0 포트 연결   | USB 3.0 (파란색) 포트에 직접 연결 |
-| USB 허브 사용       | 허브 없이 PC 본체에 직접 연결     |
-| pnputil "연결 끊김" | 물리적 재연결 필요                |
-
-### RS2_USB_STATUS_ACCESS 에러
-
-```
-failed to open usb interface: 0, error: RS2_USB_STATUS_ACCESS
-```
-
-→ USB 권한 문제. `sudo chmod 666 /dev/bus/usb/002/*` 실행 후 재시도.
-
-### make 중 OOM (Out of Memory)
-
-```
-c++: fatal error: Killed signal terminated program cc1plus
-```
-
-→ 병렬 수 줄이기: `make -j4` 또는 `make -j2` 사용.
-→ WSL2 메모리 늘리기: `%UserProfile%\.wslconfig` 에서 `memory=8GB` 설정.
-
-```ini
-# %UserProfile%\.wslconfig
-[wsl2]
-memory=8GB
-swap=4GB
-```
-
-### librealsense가 카메라를 감지 못함
-
-```
-No device detected. Is it plugged in?
-```
-
-1. `lsusb`로 USB 장치 목록 확인 — `8086:0b5c` 있어야 함
-2. 없으면: Windows에서 `usbipd attach --wsl --busid 5-3` 재실행
-3. 있는데 안 됨: `sudo chmod 666 /dev/bus/usb/002/*` 후 재시도
-4. 링크 확인: `ldd ./rtabmap_2d_pipeline | grep realsense` → `/usr/local/lib/` (RSUSB) 인지 확인
-
-### apt의 librealsense2와 혼동
-
-시스템에 두 버전이 공존할 수 있음:
-
-- `/usr/lib/x86_64-linux-gnu/librealsense2.so` — apt 설치 (V4L2 백엔드, WSL2에서 **동작 안함**)
-- `/usr/local/lib/librealsense2.so` — 소스 빌드 (RSUSB 백엔드, **이것을 사용해야 함**)
-
-바이너리가 올바른 버전에 링크되는지 항상 확인:
-
-```bash
-ldd ./rtabmap_2d_pipeline | grep realsense
-# → /usr/local/lib/librealsense2.so.2.57 이어야 함
+```powershell
+& $cmakeBin .. -Wno-dev
+& $cmakeBin --build . --config Release --parallel
 ```
 
 ---
 
-## 11. 최종 환경 요약
+## 8. 트러블슈팅
 
-### 소프트웨어 버전
-
-| 구성요소      | 버전                             | 설치 방법              |
-| ------------- | -------------------------------- | ---------------------- |
-| Ubuntu        | 22.04 LTS (Jammy)                | WSL2                   |
-| WSL2 커널     | 6.6.87.2-microsoft-standard-WSL2 | 자동                   |
-| CMake         | 3.22                             | apt                    |
-| GCC           | 11.x                             | apt (build-essential)  |
-| OpenCV        | 4.5.4                            | apt (libopencv-dev)    |
-| PCL           | 1.12.1                           | apt (libpcl-dev)       |
-| Boost         | 1.74                             | apt (libboost-all-dev) |
-| librealsense2 | 2.57.7                           | **소스 빌드** (RSUSB)  |
-| RTAB-Map      | 0.23.4                           | 소스 빌드              |
-| usbipd-win    | 5.3.0                            | winget (Windows)       |
-
-### 설치 경로
-
-| 항목                | 경로                                                  |
-| ------------------- | ----------------------------------------------------- |
-| RTAB-Map 소스       | `~/dev/rtabmap/`                                      |
-| RTAB-Map 설치       | `/usr/local/lib/`, `/usr/local/include/`              |
-| librealsense 소스   | `~/librealsense/`                                     |
-| librealsense 설치   | `/usr/local/lib/`, `/usr/local/bin/`                  |
-| 파이프라인 소스     | `~/dev/rtabmap_2d_pipeline/`                          |
-| 파이프라인 바이너리 | `~/dev/rtabmap_2d_pipeline/build/rtabmap_2d_pipeline` |
-| SLAM 데이터베이스   | `~/dev/rtabmap_2d_pipeline/build/rtabmap.db`          |
-| 맵 출력             | `~/dev/rtabmap_2d_pipeline/build/output/`             |
-
-### RealSense D455F 정보
-
-| 항목         | 값           |
-| ------------ | ------------ |
-| 시리얼 넘버  | 254122300022 |
-| 펌웨어       | 5.15.1.55    |
-| USB 타입     | 3.2          |
-| Product ID   | 0x0B5C       |
-| IMU          | BMI085       |
-| usbipd BUSID | 5-3          |
-
-### 빠른 실행 체크리스트
+### Qt platform plugin 에러
 
 ```
-□ WSL2 터미널 열기
-□ (Windows 관리자 PowerShell) usbipd attach --wsl --busid 5-3
-□ (WSL2) sudo chmod 666 /dev/bus/usb/002/*
-□ (WSL2) cd ~/dev/rtabmap_2d_pipeline/build && ./rtabmap_2d_pipeline
-□ 카메라를 이동하며 맵 생성 확인
-□ Ctrl+C로 종료
+qt.qpa.plugin: Could not find the Qt platform plugin "windows" in ""
+```
+
+→ `QT_PLUGIN_PATH` 설정 필요. `run_rtabmap.bat` 사용 추천.
+
+```powershell
+$env:QT_PLUGIN_PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\Qt6\plugins"
+```
+
+### DLL을 찾을 수 없음
+
+```
+The code execution cannot proceed because XXX.dll was not found
+```
+
+→ PATH에 DLL 경로 추가:
+
+```powershell
+$env:PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\bin;C:\dev\rtabmap\build\bin;$env:PATH"
+```
+
+### psapi.lib 링크 에러
+
+```
+LINK : fatal error LNK1181: cannot open input file 'psapi.lib'
+```
+
+→ CMake 구성 시 Windows SDK 버전 확인 후 경로 수정:
+
+```powershell
+Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" | Select-Object Name
+# → 본인 버전으로 $psapi 경로 업데이트
+```
+
+### RealSense 카메라 미감지
+
+- USB 3.0 포트에 **직접** 연결 (허브 사용 금지)
+- 케이블 뺐다 다시 꽂기
+- 장치 관리자에서 "Intel RealSense D455" 인식 확인
+
+---
+
+## 9. 프로젝트 구조
+
+```
+C:\dev\
+├── .gitignore
+├── run_rtabmap.bat          ← 실행 배치 파일
+├── plan.md                  ← 프로젝트 계획
+├── SETUP_GUIDE.md           ← 이 문서
+│
+├── rtabmap/                 ← RTAB-Map 0.23.4 소스 (수정됨)
+│   ├── CMakeLists.txt
+│   ├── app/src/main.cpp     ← RTABMap.exe 진입점
+│   ├── corelib/             ← SLAM 엔진
+│   ├── guilib/              ← Qt GUI (★ 우리 수정 여기)
+│   │   ├── include/rtabmap/gui/
+│   │   │   ├── GridTcpStreamer.h    ★ 신규
+│   │   │   └── MainWindow.h        ★ 수정
+│   │   └── src/
+│   │       ├── GridTcpStreamer.cpp  ★ 신규
+│   │       ├── MainWindow.cpp      ★ 수정
+│   │       └── CMakeLists.txt      ★ 수정
+│   ├── utilite/             ← 유틸리티 라이브러리
+│   ├── tools/               ← CLI 도구 (calibration, export 등)
+│   └── cmake_modules/       ← CMake Find 모듈
+│
+├── rtabmap_2d_pipeline/     ← 테스트 유틸리티
+│   ├── test_client.py       ← TCP 수신 테스트 (Python)
+│   ├── main.cpp             ← headless 파이프라인 (참고용)
+│   ├── GridPublisher.h      ← TCP 프로토콜 정의 (참고용)
+│   └── CMakeLists.txt
+│
+├── vcpkg_export/            ← ⬇️ 별도 다운로드 (gitignore)
+└── vcpkg-export.7z          ← ⬇️ 별도 다운로드 (gitignore)
 ```
