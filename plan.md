@@ -267,13 +267,13 @@ cv::Mat (CV_8S) — 2D Occupancy Grid
 
 ## 의사결정 로그
 
-| 날짜       | 결정 사항                                   | 근거                                                                         |
-| ---------- | ------------------------------------------- | ---------------------------------------------------------------------------- |
-| 2026-04-15 | TCP 소켓 확정, 공유 메모리 검토 중          | 같은 PC 내 Unity 연동, 공유 메모리는 성능 이점 있으나 복잡도↑                |
-| 2026-04-15 | 실시간 필수 (후처리 불가)                   | 차량이 주행 중 경로계획에 grid 필요                                          |
-| 2026-04-17 | D455f 전용 파라미터 추가                    | 내장 IMU 활용: GravitySigma=0.3, AlignWithGround=true                        |
-| 2026-04-20 | **WSL2 → Windows 네이티브 GUI로 전환**      | vcpkg 사전빌드 export로 libarchive 버그 우회, GUI(3D+2D+LoopClosure) 활용    |
-| 2026-04-20 | RTAB-Map 소스 직접 수정 방식 채택           | GUI 기능 활용 + TCP 스트리밍 통합, 별도 바이너리 불필요                      |
-| 2026-04-20 | GridTcpStreamer 클래스 추가 (guilib)        | MainWindow에 TCP 서버 통합, Tools 메뉴에서 on/off                            |
-| 2026-04-20 | getCustomParameters()에 D455f 파라미터      | Start 시 자동 적용, Preferences 대화상자보다 우선                            |
-| 2026-04-20 | Graph View 기본 표시                        | 2D Grid(점유 그리드) 패널을 기본으로 표시하여 즉시 확인 가능                 |
+| 날짜       | 결정 사항                              | 근거                                                                      |
+| ---------- | -------------------------------------- | ------------------------------------------------------------------------- |
+| 2026-04-15 | TCP 소켓 확정, 공유 메모리 검토 중     | 같은 PC 내 Unity 연동, 공유 메모리는 성능 이점 있으나 복잡도↑             |
+| 2026-04-15 | 실시간 필수 (후처리 불가)              | 차량이 주행 중 경로계획에 grid 필요                                       |
+| 2026-04-17 | D455f 전용 파라미터 추가               | 내장 IMU 활용: GravitySigma=0.3, AlignWithGround=true                     |
+| 2026-04-20 | **WSL2 → Windows 네이티브 GUI로 전환** | vcpkg 사전빌드 export로 libarchive 버그 우회, GUI(3D+2D+LoopClosure) 활용 |
+| 2026-04-20 | RTAB-Map 소스 직접 수정 방식 채택      | GUI 기능 활용 + TCP 스트리밍 통합, 별도 바이너리 불필요                   |
+| 2026-04-20 | GridTcpStreamer 클래스 추가 (guilib)   | MainWindow에 TCP 서버 통합, Tools 메뉴에서 on/off                         |
+| 2026-04-20 | getCustomParameters()에 D455f 파라미터 | Start 시 자동 적용, Preferences 대화상자보다 우선                         |
+| 2026-04-20 | Graph View 기본 표시                   | 2D Grid(점유 그리드) 패널을 기본으로 표시하여 즉시 확인 가능              |
