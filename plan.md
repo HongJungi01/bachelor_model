@@ -267,13 +267,151 @@ cv::Mat (CV_8S) — 2D Occupancy Grid
 
 ## 의사결정 로그
 
-| 날짜       | 결정 사항                              | 근거                                                                      |
-| ---------- | -------------------------------------- | ------------------------------------------------------------------------- |
-| 2026-04-15 | TCP 소켓 확정, 공유 메모리 검토 중     | 같은 PC 내 Unity 연동, 공유 메모리는 성능 이점 있으나 복잡도↑             |
-| 2026-04-15 | 실시간 필수 (후처리 불가)              | 차량이 주행 중 경로계획에 grid 필요                                       |
-| 2026-04-17 | D455f 전용 파라미터 추가               | 내장 IMU 활용: GravitySigma=0.3, AlignWithGround=true                     |
-| 2026-04-20 | **WSL2 → Windows 네이티브 GUI로 전환** | vcpkg 사전빌드 export로 libarchive 버그 우회, GUI(3D+2D+LoopClosure) 활용 |
-| 2026-04-20 | RTAB-Map 소스 직접 수정 방식 채택      | GUI 기능 활용 + TCP 스트리밍 통합, 별도 바이너리 불필요                   |
-| 2026-04-20 | GridTcpStreamer 클래스 추가 (guilib)   | MainWindow에 TCP 서버 통합, Tools 메뉴에서 on/off                         |
-| 2026-04-20 | getCustomParameters()에 D455f 파라미터 | Start 시 자동 적용, Preferences 대화상자보다 우선                         |
-| 2026-04-20 | Graph View 기본 표시                   | 2D Grid(점유 그리드) 패널을 기본으로 표시하여 즉시 확인 가능              |
+| 날짜       | 결정 사항                                         | 근거                                                                                                                                                                                                   |
+| ---------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2026-04-15 | TCP 소켓 확정, 공유 메모리 검토 중                | 같은 PC 내 Unity 연동, 공유 메모리는 성능 이점 있으나 복잡도↑                                                                                                                                          |
+| 2026-04-15 | 실시간 필수 (후처리 불가)                         | 차량이 주행 중 경로계획에 grid 필요                                                                                                                                                                    |
+| 2026-04-17 | D455f 전용 파라미터 추가                          | 내장 IMU 활용: GravitySigma=0.3, AlignWithGround=true                                                                                                                                                  |
+| 2026-04-20 | **WSL2 → Windows 네이티브 GUI로 전환**            | vcpkg 사전빌드 export로 libarchive 버그 우회, GUI(3D+2D+LoopClosure) 활용                                                                                                                              |
+| 2026-04-20 | RTAB-Map 소스 직접 수정 방식 채택                 | GUI 기능 활용 + TCP 스트리밍 통합, 별도 바이너리 불필요                                                                                                                                                |
+| 2026-04-20 | GridTcpStreamer 클래스 추가 (guilib)              | MainWindow에 TCP 서버 통합, Tools 메뉴에서 on/off                                                                                                                                                      |
+| 2026-04-20 | getCustomParameters()에 D455f 파라미터            | Start 시 자동 적용, Preferences 대화상자보다 우선                                                                                                                                                      |
+| 2026-04-20 | Graph View 기본 표시                              | 2D Grid(점유 그리드) 패널을 기본으로 표시하여 즉시 확인 가능                                                                                                                                           |
+| 2026-04-18 | **Unity 가상 카메라 오프라인 연동 추가**          | Unity 시뮬레이션 데이터셋을 RTAB-Map으로 후처리하여 2D 점유 맵 생성                                                                                                                                    |
+| 2026-04-18 | `rtabmap_unity_bridge/` 프로젝트 생성             | RealSense 물리 카메라 파이프라인과 분리, CameraRGBDImages 기반 오프라인 배치                                                                                                                           |
+| 2026-04-18 | 가상 IMU 생성 (Unity Transform 기반)              | FixedUpdate에서 rotation/position 변화량으로 gyro/accel 계산, CSV 출력                                                                                                                                 |
+| 2026-04-18 | `rtabmap-rgbd_dataset` 대신 커스텀 파이프라인     | 기존 도구가 TUM/Bonn만 지원 + depthScale 하드코딩 + IMU 미지원                                                                                                                                         |
+| 2026-04-18 | 인라인 IMU 파싱 (CidSimsDataset 패턴)             | 오프라인 배치에 적합, IMUThread 비동기 방식보다 정밀한 타이밍 동기화                                                                                                                                   |
+| 2026-04-19 | **커스텀 파이프라인 → RTABMap GUI 방식으로 변경** | RTABMap GUI가 RGBD Images 소스 + IMU CSV를 네이티브 지원 (IMUThread). 별도 C++ 빌드 불필요, 기존 run_rtabmap.bat과 동일한 GUI 유지. rtabmap_unity_bridge/ 프로젝트는 보존하되 주력은 GUI 방식으로 전환 |
+
+---
+
+## Step 4. Unity 가상 카메라 → RTAB-Map 연동
+
+> Unity 시뮬레이션에서 캡처한 RGBD + IMU 데이터셋을 RTABMap GUI에서 오프라인 처리.
+> 기존 `run_rtabmap.bat`과 동일한 GUI 유지, 소스만 RGBD Images + IMU CSV로 변경.
+>
+> **방식 변경 (2026-04-19)**: 커스텀 C++ 파이프라인(`rtabmap_unity_bridge/`) 대신
+> RTABMap.exe GUI의 내장 RGBD Images 소스 + IMUThread를 활용.
+
+### 4-A. GUI 방식 (현재 주력) ✅
+
+**원리**: RTABMap GUI가 이미 `CameraRGBDImages` + `IMUThread`를 네이티브 지원.
+별도 빌드 없이 GUI Preferences에서 경로만 설정하면 됨.
+
+**실행**: `run_rtabmap_unity.bat` → RTABMap.exe 실행 → GUI에서 Start
+
+**GUI 설정 (최초 1회)**:
+
+| 설정 항목                | 위치                                | 값                              |
+| ------------------------ | ----------------------------------- | ------------------------------- |
+| Source Type              | Preferences → Source → RGB-D Camera | **RGBD Images**                 |
+| RGB path                 | 같은 패널                           | `데이터셋/rgb_sync/`            |
+| Depth path               | 같은 패널                           | `데이터셋/depth_sync/`          |
+| Depth scale factor       | 같은 패널                           | **1000** (16-bit mm → meter)    |
+| Filenames are timestamps | 같은 패널                           | ✅ 체크                         |
+| IMU path                 | Preferences → Source → Images 옵션  | `데이터셋/imu.csv`              |
+| IMU local transform      | 같은 패널                           | `0 0 1 0 -1 0 0 0 0 -1 0 0`     |
+| IMU rate                 | 같은 패널                           | `0` (무제한)                    |
+| Calibration              | 데이터셋 폴더 내                    | `d455_virtual.yaml` (자동 감지) |
+
+**IMU 포맷 호환성**:
+
+- Unity `RGBD_DataCollector.cs`의 `imu.csv` 출력: `timestamp,gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z`
+- RTABMap `IMUThread.cpp` 입력: 동일한 EuRoC CSV 형식 (첫 줄 헤더 skip, 쉼표 구분)
+- timestamp에 `.` 포함 → epoch seconds로 파싱 (상대 시간 OK)
+
+### 4-B. 커스텀 파이프라인 (보존, 백업용)
+
+### 4-0. 아키텍처
+
+```
+Unity (RGBD_DataCollector)   → 디스크 저장
+  │  rgb_sync/*.png (1280×720, 8-bit RGB)
+  │  depth_sync/*.png (1280×720, 16-bit mm)
+  │  imu.csv (timestamp,gx,gy,gz,ax,ay,az)
+  │  d455_virtual.yaml (캘리브레이션)
+  ▼
+rtabmap_unity_offline.exe    → 오프라인 배치 처리
+  CameraRGBDImages(디스크) → SensorCaptureThread(IMU필터) → Odometry → Rtabmap
+                                                                  │
+                                                           GridPublisher
+                                                         ┌───────┼────────┐
+                                                         ▼       ▼        ▼
+                                                      OpenCV   TCP     PGM+YAML
+                                                      Window   7777    output/
+```
+
+### 4-1. 프로젝트 구조
+
+- [x] **`rtabmap_unity_bridge/`** ✅ 생성 완료
+
+  ```
+  rtabmap_unity_bridge/
+  ├── CMakeLists.txt          ← 빌드 설정 (rtabmap::core + OpenCV, Qt 불필요)
+  ├── main.cpp                ← 오프라인 배치 파이프라인 (CameraRGBDImages + IMU)
+  ├── GridPublisher.h         ← 2D grid 추출 + 시각화 + TCP + 파일 (processOffline 추가)
+  ├── run_offline.bat         ← 실행 스크립트
+  └── README.md               ← 사용법 + 데이터셋 포맷 문서
+  ```
+
+### 4-2. Unity 측 수정
+
+- [x] **RGBD_DataCollector.cs — IMU CSV 출력 추가** ✅
+
+  | 추가 항목                | 설명                                                     |
+  | ------------------------ | -------------------------------------------------------- |
+  | `FixedUpdate()` IMU 기록 | `transform.rotation/position` 변화량에서 gyro/accel 계산 |
+  | `imu.csv` StreamWriter   | `timestamp,gx,gy,gz,ax,ay,az` 포맷, ~50Hz (FixedUpdate)  |
+  | 중력 보상                | specific force = physical_accel + (0, 9.81, 0)           |
+  | 좌표 변환                | 월드 프레임 → 카메라 로컬 프레임 (Inverse rotation)      |
+
+- [x] **verify_dataset.py — IMU 검증 추가** ✅
+
+  | 검증 항목       | 내용                                                     |
+  | --------------- | -------------------------------------------------------- |
+  | imu.csv 존재    | 선택적 — 없으면 --no-imu로 실행 가능                     |
+  | 헤더 형식       | `timestamp,gyro_x,gyro_y,gyro_z,accel_x,accel_y,accel_z` |
+  | 샘플 수/율/기간 | 50Hz 근처, 이미지 기간과 매칭                            |
+  | 중력 참조       | 정지 시 accel_y ≈ 9.81                                   |
+
+### 4-3. C++ 파이프라인
+
+- [x] **main.cpp 작성** ✅ — CidSimsDataset 패턴 기반 오프라인 배치 루프
+
+  핵심 구현:
+  1. `CameraRGBDImages(rgb_sync, depth_sync, depthScaleFactor=1.0)` 생성
+  2. `setTimestamps(true, "", false)` — 파일명이 타임스탬프
+  3. `SensorCaptureThread(camera, params)` — postUpdate용 (스레드 아님)
+  4. `enableIMUFiltering(1)` — Complementary filter
+  5. `camera->init(datasetPath, "d455_virtual")` — 캘리브레이션 로드
+  6. 배치 루프: IMU 인라인 파싱 → odom->process() → rtabmap.process()
+  7. `GridPublisher.processOffline(stats, odomPose)` — 직접 호출
+
+- [x] **GridPublisher.h 수정** ✅ — `processOffline()` + `saveFinalMap()` 추가
+
+### 4-4. 좌표계 변환
+
+| 변환                        | 행렬 (3×4, row-major)           | 설명                                |
+| --------------------------- | ------------------------------- | ----------------------------------- |
+| camera optical → base_link  | `[0,0,1,0, -1,0,0,0, 0,-1,0,0]` | d455_virtual.yaml `local_transform` |
+| base_link → IMU (Unity cam) | `[0,-1,0,0, 0,0,1,0, 1,0,0,0]`  | main.cpp `baseToImu`                |
+
+### 4-5. 빌드 & 실행
+
+- [ ] **빌드 확인**
+
+  ```powershell
+  cd C:\dev\rtabmap_unity_bridge\build
+  cmake .. -DCMAKE_PREFIX_PATH="C:/dev/vcpkg_export/installed/x64-windows-release;C:/dev/rtabmap/build/install"
+  cmake --build . --config Release
+  ```
+
+- [ ] **Unity에서 데이터셋 수집 → 검증 → 실행**
+
+  ```powershell
+  python verify_dataset.py C:\D455_Dataset
+  run_offline.bat C:\D455_Dataset
+  ```
+
+- [ ] **TCP + test_client.py로 그리드 수신 확인**
