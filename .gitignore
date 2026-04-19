@@ -1,6 +1,7 @@
 # === Build outputs ===
 rtabmap/build/
 rtabmap_2d_pipeline/build/
+rtabmap_unity_bridge/build/
 
 # === vcpkg pre-built dependencies (large, downloadable) ===
 vcpkg_export/
