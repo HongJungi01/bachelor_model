@@ -65,7 +65,10 @@ CameraImages::CameraImages() :
 		_groundTruthFormat(0),
 		_groundTruthLocalTransform(Transform::getIdentity()),
 		_maxPoseTimeDiff(0.02),
-		_captureDelay(0.0)
+		_captureDelay(0.0),
+		_liveFolder(false),
+		_liveIdleTimeoutSec(10.0),
+		_livePollIntervalSec(0.2)
 	{}
 CameraImages::CameraImages(const std::string & path,
 					 float imageRate,
@@ -96,7 +99,10 @@ CameraImages::CameraImages(const std::string & path,
 	_groundTruthFormat(0),
 	_groundTruthLocalTransform(Transform::getIdentity()),
 	_maxPoseTimeDiff(0.02),
-	_captureDelay(0.0)
+	_captureDelay(0.0),
+	_liveFolder(false),
+	_liveIdleTimeoutSec(10.0),
+	_livePollIntervalSec(0.2)
 {
 
 }
@@ -793,6 +799,25 @@ SensorData CameraImages::captureImage(SensorCaptureInfo * info)
 		{
 			std::string imageFileName = _dir?_dir->getNextFileName():"";
 			std::string scanFileName = _scanDir?_scanDir->getNextFileName():"";
+			if(_liveFolder && ((_dir && imageFileName.empty()) || (_scanDir && scanFileName.empty())))
+			{
+				UTimer liveWaitTimer;
+				int pollMs = (int)(_livePollIntervalSec * 1000.0);
+				if(pollMs < 10) pollMs = 10;
+				while((_dir && imageFileName.empty()) || (_scanDir && scanFileName.empty()))
+				{
+					uSleep(pollMs);
+					if(_dir)     _dir->update();
+					if(_scanDir) _scanDir->update();
+					imageFileName = _dir?_dir->getNextFileName():"";
+					scanFileName  = _scanDir?_scanDir->getNextFileName():"";
+					if(_liveIdleTimeoutSec > 0.0 && liveWaitTimer.getElapsedTime() >= _liveIdleTimeoutSec)
+					{
+						UINFO("CameraImages: live folder idle timeout (%.1fs) reached, stopping.", _liveIdleTimeoutSec);
+						break;
+					}
+				}
+			}
 			if((_dir && !imageFileName.empty()) || (!_dir && !scanFileName.empty()))
 			{
 				imageFilePath = _path + imageFileName;

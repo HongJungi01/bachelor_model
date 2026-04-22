@@ -4479,6 +4479,52 @@ when using the file type, logs are saved in LogRtabmap.txt (located in the worki
                                        </property>
                                       </widget>
                                      </item>
+                                     <item row="5" column="1">
+                                      <widget class="QCheckBox" name="checkBox_cameraRGBDImages_liveFolder">
+                                       <property name="text">
+                                        <string>Live folder</string>
+                                       </property>
+                                      </widget>
+                                     </item>
+                                     <item row="5" column="2">
+                                      <widget class="QLabel" name="label_cameraRGBDImages_liveFolder">
+                                       <property name="text">
+                                        <string>Continuous capture: when the folder is exhausted, block-wait for new images (e.g. being written by Unity) instead of stopping.</string>
+                                       </property>
+                                       <property name="wordWrap">
+                                        <bool>true</bool>
+                                       </property>
+                                      </widget>
+                                     </item>
+                                     <item row="6" column="1">
+                                      <widget class="QDoubleSpinBox" name="doubleSpinBox_cameraRGBDImages_liveIdleTimeout">
+                                       <property name="decimals">
+                                        <number>1</number>
+                                       </property>
+                                       <property name="minimum">
+                                        <double>0.000000000000000</double>
+                                       </property>
+                                       <property name="maximum">
+                                        <double>600.000000000000000</double>
+                                       </property>
+                                       <property name="singleStep">
+                                        <double>1.000000000000000</double>
+                                       </property>
+                                       <property name="value">
+                                        <double>10.000000000000000</double>
+                                       </property>
+                                      </widget>
+                                     </item>
+                                     <item row="6" column="2">
+                                      <widget class="QLabel" name="label_cameraRGBDImages_liveIdleTimeout">
+                                       <property name="text">
+                                        <string>Live folder idle timeout (seconds). If no new image appears for this duration, mapping stops. 0 means wait forever.</string>
+                                       </property>
+                                       <property name="wordWrap">
+                                        <bool>true</bool>
+                                       </property>
+                                      </widget>
+                                     </item>
                                     </layout>
                                    </widget>
                                   </item>

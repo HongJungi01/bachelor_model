@@ -51,6 +51,11 @@ public:
 
 	virtual void setStartIndex(int index) {CameraImages::setStartIndex(index);cameraDepth_.setStartIndex(index);} // negative means last
 	virtual void setMaxFrames(int value) {CameraImages::setMaxFrames(value);cameraDepth_.setMaxFrames(value);}
+	virtual void setLiveFolder(bool enabled, double idleTimeoutSec = 10.0, double pollIntervalSec = 0.2)
+	{
+		CameraImages::setLiveFolder(enabled, idleTimeoutSec, pollIntervalSec);
+		cameraDepth_.setLiveFolder(enabled, idleTimeoutSec, pollIntervalSec);
+	}
 
 protected:
 	virtual SensorData captureImage(SensorCaptureInfo * info = 0);
