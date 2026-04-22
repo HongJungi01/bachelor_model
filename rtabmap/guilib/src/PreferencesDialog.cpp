@@ -848,6 +848,8 @@ PreferencesDialog::PreferencesDialog(QWidget * parent) :
 	connect(_ui->doubleSpinBox_cameraRGBDImages_scale, SIGNAL(valueChanged(double)), this, SLOT(makeObsoleteSourcePanel()));
 	connect(_ui->spinBox_cameraRGBDImages_startIndex, SIGNAL(valueChanged(int)), this, SLOT(makeObsoleteSourcePanel()));
 	connect(_ui->spinBox_cameraRGBDImages_maxFrames, SIGNAL(valueChanged(int)), this, SLOT(makeObsoleteSourcePanel()));
+	connect(_ui->checkBox_cameraRGBDImages_liveFolder, SIGNAL(stateChanged(int)), this, SLOT(makeObsoleteSourcePanel()));
+	connect(_ui->doubleSpinBox_cameraRGBDImages_liveIdleTimeout, SIGNAL(valueChanged(double)), this, SLOT(makeObsoleteSourcePanel()));
 	connect(_ui->lineEdit_cameraImages_path_scans, SIGNAL(textChanged(const QString &)), this, SLOT(makeObsoleteSourcePanel()));
 	connect(_ui->lineEdit_cameraImages_laser_transform, SIGNAL(textChanged(const QString &)), this, SLOT(makeObsoleteSourcePanel()));
 	connect(_ui->spinBox_cameraImages_max_scan_pts, SIGNAL(valueChanged(int)), this, SLOT(makeObsoleteSourcePanel()));
@@ -2324,6 +2326,8 @@ void PreferencesDialog::resetSettings(QGroupBox * groupBox)
 		_ui->doubleSpinBox_cameraRGBDImages_scale->setValue(1.0);
 		_ui->spinBox_cameraRGBDImages_startIndex->setValue(0);
 		_ui->spinBox_cameraRGBDImages_maxFrames->setValue(0);
+		_ui->checkBox_cameraRGBDImages_liveFolder->setChecked(false);
+		_ui->doubleSpinBox_cameraRGBDImages_liveIdleTimeout->setValue(10.0);
 		_ui->lineEdit_source_distortionModel->setText("");
 		_ui->groupBox_bilateral->setChecked(false);
 		_ui->doubleSpinBox_bilateral_sigmaS->setValue(10.0);
@@ -2843,6 +2847,8 @@ void PreferencesDialog::readCameraSettings(const QString & filePath)
 	_ui->doubleSpinBox_cameraRGBDImages_scale->setValue(settings.value("scale", _ui->doubleSpinBox_cameraRGBDImages_scale->value()).toDouble());
 	_ui->spinBox_cameraRGBDImages_startIndex->setValue(settings.value("start_index", _ui->spinBox_cameraRGBDImages_startIndex->value()).toInt());
 	_ui->spinBox_cameraRGBDImages_maxFrames->setValue(settings.value("max_frames", _ui->spinBox_cameraRGBDImages_maxFrames->value()).toInt());
+	_ui->checkBox_cameraRGBDImages_liveFolder->setChecked(settings.value("live_folder", _ui->checkBox_cameraRGBDImages_liveFolder->isChecked()).toBool());
+	_ui->doubleSpinBox_cameraRGBDImages_liveIdleTimeout->setValue(settings.value("live_idle_timeout", _ui->doubleSpinBox_cameraRGBDImages_liveIdleTimeout->value()).toDouble());
 	settings.endGroup(); // RGBDImages
 
 	settings.beginGroup("StereoImages");
@@ -3465,6 +3471,8 @@ void PreferencesDialog::writeCameraSettings(const QString & filePath) const
 	settings.setValue("scale",               _ui->doubleSpinBox_cameraRGBDImages_scale->value());
 	settings.setValue("start_index",         _ui->spinBox_cameraRGBDImages_startIndex->value());
 	settings.setValue("max_frames",         _ui->spinBox_cameraRGBDImages_maxFrames->value());
+	settings.setValue("live_folder",        _ui->checkBox_cameraRGBDImages_liveFolder->isChecked());
+	settings.setValue("live_idle_timeout",  _ui->doubleSpinBox_cameraRGBDImages_liveIdleTimeout->value());
 	settings.endGroup(); // RGBDImages
 
 	settings.beginGroup("StereoImages");
@@ -6942,6 +6950,9 @@ Camera * PreferencesDialog::createCamera(
 			this->getSourceLocalTransform());
 		((CameraRGBDImages*)camera)->setStartIndex(_ui->spinBox_cameraRGBDImages_startIndex->value());
 		((CameraRGBDImages*)camera)->setMaxFrames(_ui->spinBox_cameraRGBDImages_maxFrames->value());
+		((CameraRGBDImages*)camera)->setLiveFolder(
+				_ui->checkBox_cameraRGBDImages_liveFolder->isChecked(),
+				_ui->doubleSpinBox_cameraRGBDImages_liveIdleTimeout->value());
 		((CameraRGBDImages*)camera)->setBayerMode(_ui->comboBox_cameraImages_bayerMode->currentIndex()-1);
 		((CameraRGBDImages*)camera)->setOdometryPath(_ui->lineEdit_cameraImages_odom->text().toStdString(), _ui->comboBox_cameraImages_odomFormat->currentIndex());
 		((CameraRGBDImages*)camera)->setGroundTruthPath(_ui->lineEdit_cameraImages_gt->text().toStdString(), _ui->comboBox_cameraImages_gtFormat->currentIndex(), this->getGroundTruthLocalTransform());

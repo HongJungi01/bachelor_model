@@ -60,6 +60,12 @@ bool CameraRGBDImages::init(const std::string & calibrationFolder, const std::st
 		{
 			success = true;
 		}
+		else if(this->isLiveFolder())
+		{
+			UINFO("Live folder mode: RGB(%d) vs Depth(%d) counts differ, proceeding.",
+					this->imagesCount(), cameraDepth_.imagesCount());
+			success = true;
+		}
 		else
 		{
 			UERROR("Cameras don't have the same number of images (%d vs %d)",

@@ -62,6 +62,16 @@ public:
 	virtual void setStartIndex(int index) {_startAt = index;} // negative means last
 	virtual void setMaxFrames(int value) {_maxFrames = value;}
 	void setDirRefreshed(bool enabled) {_refreshDir = enabled;}
+	// Live folder mode: when the directory is exhausted, block-wait for new files
+	// instead of returning empty data. idleTimeoutSec==0 means wait forever.
+	virtual void setLiveFolder(bool enabled, double idleTimeoutSec = 10.0, double pollIntervalSec = 0.2)
+	{
+		_liveFolder = enabled;
+		_liveIdleTimeoutSec = idleTimeoutSec;
+		_livePollIntervalSec = pollIntervalSec;
+		if(enabled) _refreshDir = true;
+	}
+	bool isLiveFolder() const {return _liveFolder;}
 	void setImagesRectified(bool enabled) {_rectifyImages = enabled;}
 	void setBayerMode(int mode) {_bayerMode = mode;} // -1=disabled (default) 0=BayerBG, 1=BayerGB, 2=BayerRG, 3=BayerGR
 
@@ -177,6 +187,10 @@ private:
 
 	UTimer _captureTimer;
 	double _captureDelay;
+
+	bool _liveFolder;
+	double _liveIdleTimeoutSec;
+	double _livePollIntervalSec;
 };
 
 
