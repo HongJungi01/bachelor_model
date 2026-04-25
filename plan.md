@@ -53,6 +53,12 @@
 - [x] **0-W-7. GUI 실행 확인** ✅
   - RTABMap.exe 정상 실행, 크래시 없음
 
+- [x] **0-W-8. 원클릭 소스 토글 추가 (2026-04-25)** ✅
+  - **수정**: `guilib/include/rtabmap/gui/MainWindow.h` — `selectSourceRealSense` / `selectSourceUnityImages` 슬롯, `_actionSourceRealSense` / `_actionSourceUnityImages` / `_sourceToggleGroup` 멤버
+  - **수정**: `guilib/src/MainWindow.cpp` — Tools 메뉴 상단에 두 개의 체크 가능한 액션을 `QActionGroup`으로 묶어 추가. Unity Images 선택 시 `QFileDialog`로 데이터셋 폴더 픽
+  - 효과: `run_rtabmap_unity.bat` 폐기, Preferences를 매번 열지 않고 메뉴 한 번 클릭으로 RealSense ↔ Unity Images 전환
+  - 한계: PreferencesDialog에 path setter 공개 API 없음 → 토글은 소스 타입만 전환, RGB/Depth/IMU 경로는 데이터셋당 한 번 Preferences에서 설정 (이후 유지됨)
+
 ### Step 1. Grid 파라미터 튜닝
 
 - [ ] **1-1. 실제 환경에서 기본 파라미터로 매핑 테스트**
@@ -83,14 +89,16 @@
 
 > `examples/RGBDMapping/` 예제를 기반으로 Qt GUI를 제거하고, 대신 2D grid 추출 + 출력 모듈(GridPublisher)로 교체
 
-- [x] **2-1. 프로젝트 생성** ✅ 완료
+- [x] **2-1. 프로젝트 생성** ✅ 완료 (이후 `rtabmap_pipeline/`로 통합 — 4-1 참조)
 
   ```
-  rtabmap_2d_pipeline/
-  ├── CMakeLists.txt       ← rtabmap::core, rtabmap::utilite + OpenCV highgui 링크 (Qt 불필요)
-  ├── main.cpp             ← 스레드 파이프라인 구성 + 이벤트 연결 (D455f IMU 파라미터 포함)
+  rtabmap_pipeline/
+  ├── CMakeLists.txt       ← rtabmap::core, rtabmap::utilite + OpenCV (Qt 불필요)
+  ├── main.cpp             ← --source realsense | images, makeParams + runLive/runOffline
   ├── GridPublisher.h      ← UEventsHandler: 2D grid 추출 + OpenCV 시각화 + TCP + 파일 출력
-  └── test_client.py       ← Python TCP 수신 테스트 (OpenCV 시각화)
+  ├── test_client.py       ← Python TCP 수신 테스트 (OpenCV 시각화)
+  ├── run_realsense.bat    ← live 모드 단축 스크립트
+  └── run_offline.bat      ← offline 모드 단축 스크립트
   ```
 
 - [x] **2-2. main.cpp 작성** ✅ 완료 — 스레드 파이프라인 구성
@@ -299,9 +307,11 @@ cv::Mat (CV_8S) — 2D Occupancy Grid
 **원리**: RTABMap GUI가 이미 `CameraRGBDImages` + `IMUThread`를 네이티브 지원.
 별도 빌드 없이 GUI Preferences에서 경로만 설정하면 됨.
 
-**실행**: `run_rtabmap_unity.bat` → RTABMap.exe 실행 → GUI에서 Start
+**실행**: `run_rtabmap.bat` → RTABMap.exe 실행 → **Tools 메뉴 → Source: Unity Images…** → 데이터셋 폴더 선택 → Start
 
-**GUI 설정 (최초 1회)**:
+> 2026-04-25 추가: `MainWindow.cpp`에 원클릭 소스 토글 (`selectSourceRealSense` / `selectSourceUnityImages`) 구현. 별도 `run_rtabmap_unity.bat` 폐기.
+
+**GUI 설정 (최초 1회 — 데이터셋당 경로만)**:
 
 | 설정 항목                | 위치                                | 값                              |
 | ------------------------ | ----------------------------------- | ------------------------------- |
@@ -332,7 +342,7 @@ Unity (RGBD_DataCollector)   → 디스크 저장
   │  imu.csv (timestamp,gx,gy,gz,ax,ay,az)
   │  d455_virtual.yaml (캘리브레이션)
   ▼
-rtabmap_unity_offline.exe    → 오프라인 배치 처리
+rtabmap_pipeline.exe --source images <path>  → 오프라인 배치 처리
   CameraRGBDImages(디스크) → SensorCaptureThread(IMU필터) → Odometry → Rtabmap
                                                                   │
                                                            GridPublisher
@@ -344,14 +354,20 @@ rtabmap_unity_offline.exe    → 오프라인 배치 처리
 
 ### 4-1. 프로젝트 구조
 
-- [x] **`rtabmap_unity_bridge/`** ✅ 생성 완료
+- [x] **`rtabmap_pipeline/`** ✅ 생성 완료 (live + offline 통합, 2026-04-25)
+
+  > 2026-04-18에 분리된 `rtabmap_unity_bridge/`와 기존 `rtabmap_2d_pipeline/`를
+  > 단일 폴더 `rtabmap_pipeline/`로 통합. 카메라 소스만 `--source realsense | images`
+  > 플래그로 분기되며, GridPublisher / 파라미터 / 빌드 설정은 모두 공유.
 
   ```
-  rtabmap_unity_bridge/
-  ├── CMakeLists.txt          ← 빌드 설정 (rtabmap::core + OpenCV, Qt 불필요)
-  ├── main.cpp                ← 오프라인 배치 파이프라인 (CameraRGBDImages + IMU)
-  ├── GridPublisher.h         ← 2D grid 추출 + 시각화 + TCP + 파일 (processOffline 추가)
-  ├── run_offline.bat         ← 실행 스크립트
+  rtabmap_pipeline/
+  ├── CMakeLists.txt          ← 단일 바이너리 (rtabmap_pipeline.exe)
+  ├── main.cpp                ← CLI + makeParams + runLive (RealSense) + runOffline (images)
+  ├── GridPublisher.h         ← 2D grid 추출 + 시각화 + TCP + 파일 (live + offline 양용)
+  ├── test_client.py          ← TCP 수신 테스트 (Python)
+  ├── run_realsense.bat       ← live 모드 단축 스크립트
+  ├── run_offline.bat         ← offline 모드 단축 스크립트
   └── README.md               ← 사용법 + 데이터셋 포맷 문서
   ```
 
@@ -402,7 +418,7 @@ rtabmap_unity_offline.exe    → 오프라인 배치 처리
 - [ ] **빌드 확인**
 
   ```powershell
-  cd C:\dev\rtabmap_unity_bridge\build
+  cd C:\dev\rtabmap_pipeline\build
   cmake .. -DCMAKE_PREFIX_PATH="C:/dev/vcpkg_export/installed/x64-windows-release;C:/dev/rtabmap/build/install"
   cmake --build . --config Release
   ```
