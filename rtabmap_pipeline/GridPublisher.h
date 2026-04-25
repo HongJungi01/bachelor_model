@@ -1,13 +1,13 @@
 /*
- * GridPublisher.h — rtabmap_unity_bridge edition
+ * GridPublisher.h
  *
  * UEventsHandler that receives RtabmapEvent/OdometryEvent,
- * extracts a 2D occupancy grid, visualizes it with OpenCV,
+ * extracts a 2D occupancy grid, visualises it with OpenCV,
  * and streams it over TCP to Unity (localhost:7777).
  *
- * Adds processOffline() for batch (non-threaded) pipeline usage.
- *
- * Based on rtabmap_2d_pipeline/GridPublisher.h
+ * Used in two modes:
+ *   - Live (RealSense): registered with UEventsManager, driven by handleEvent()
+ *   - Offline (images): not registered; main loop calls processOffline() directly
  */
 
 #ifndef GRIDPUBLISHER_H_
