@@ -84,6 +84,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QtCore/QTimer>
 #include <QtCore/QTime>
 #include <QActionGroup>
+#include <QDir>
 #include <QtGui/QDesktopServices>
 #include <QtCore/QStringList>
 #include <QtCore/QProcess>
@@ -186,7 +187,10 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	_firstCall(true),
 	_progressCanceled(false),
 	_gridTcpStreamer(0),
-	_actionTcpGridStreaming(0)
+	_actionTcpGridStreaming(0),
+	_actionSourceRealSense(0),
+	_actionSourceUnityImages(0),
+	_sourceToggleGroup(0)
 {
 	ULogger::registerCurrentThread("MainWindow");
 	UDEBUG("");
@@ -419,6 +423,21 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	connect(_ui->actionData_recorder, SIGNAL(triggered()), this, SLOT(dataRecorder()));
 	connect(_ui->actionPost_processing, SIGNAL(triggered()), this, SLOT(showPostProcessingDialog()));
 	connect(_ui->actionDepth_Calibration, SIGNAL(triggered()), this, SLOT(depthCalibration()));
+
+	// One-click source toggle: RealSense D455f ↔ Unity Images dataset
+	_actionSourceRealSense   = new QAction(tr("Source: RealSense D455f"), this);
+	_actionSourceUnityImages = new QAction(tr("Source: Unity Images…"),   this);
+	_actionSourceRealSense  ->setCheckable(true);
+	_actionSourceUnityImages->setCheckable(true);
+	_sourceToggleGroup = new QActionGroup(this);
+	_sourceToggleGroup->setExclusive(true);
+	_sourceToggleGroup->addAction(_actionSourceRealSense);
+	_sourceToggleGroup->addAction(_actionSourceUnityImages);
+	_ui->menuTools->addSeparator();
+	_ui->menuTools->addAction(_actionSourceRealSense);
+	_ui->menuTools->addAction(_actionSourceUnityImages);
+	connect(_actionSourceRealSense,   SIGNAL(triggered()), this, SLOT(selectSourceRealSense()));
+	connect(_actionSourceUnityImages, SIGNAL(triggered()), this, SLOT(selectSourceUnityImages()));
 
 	// TCP Grid Streaming action in Tools menu
 	_actionTcpGridStreaming = new QAction(tr("TCP Grid Streaming (port 7777)"), this);
@@ -5406,6 +5425,12 @@ void MainWindow::updateSelectSourceMenu()
 	_ui->actionRealSense2_SR300->setChecked(_preferencesDialog->getSourceDriver() == PreferencesDialog::kSrcRealSense2);
 	_ui->actionRealSense2_D400->setChecked(_preferencesDialog->getSourceDriver() == PreferencesDialog::kSrcRealSense2);
 	_ui->actionRealSense2_L515->setChecked(_preferencesDialog->getSourceDriver() == PreferencesDialog::kSrcRealSense2);
+
+	// Keep one-click source toggle in sync with whatever driver is currently selected
+	if(_actionSourceRealSense)
+		_actionSourceRealSense  ->setChecked(_preferencesDialog->getSourceDriver() == PreferencesDialog::kSrcRealSense2);
+	if(_actionSourceUnityImages)
+		_actionSourceUnityImages->setChecked(_preferencesDialog->getSourceDriver() == PreferencesDialog::kSrcRGBDImages);
 	_ui->actionStereoDC1394->setChecked(_preferencesDialog->getSourceDriver() == PreferencesDialog::kSrcDC1394);
 	_ui->actionStereoFlyCapture2->setChecked(_preferencesDialog->getSourceDriver() == PreferencesDialog::kSrcFlyCapture2);
 	_ui->actionStereoZed->setChecked(_preferencesDialog->getSourceDriver() == PreferencesDialog::kSrcStereoZed);
@@ -9028,6 +9053,44 @@ void MainWindow::toggleTcpGridStreaming(bool enabled)
 void MainWindow::onTcpStatusMessage(const QString & msg)
 {
 	this->statusBar()->showMessage(msg, 5000);
+}
+
+void MainWindow::selectSourceRealSense()
+{
+	_preferencesDialog->selectSourceDriver(PreferencesDialog::kSrcRealSense2);
+	this->statusBar()->showMessage(tr("Source switched to RealSense D455f"), 5000);
+}
+
+void MainWindow::selectSourceUnityImages()
+{
+	// Pick the dataset folder; remember the previous one to seed the dialog.
+	QString folder = QFileDialog::getExistingDirectory(
+		this,
+		tr("Select Unity dataset folder (must contain rgb_sync/ + depth_sync/)"),
+		_preferencesDialog->getWorkingDirectory());
+
+	if(folder.isEmpty())
+	{
+		// User cancelled — restore previous check state instead of leaving the
+		// Unity Images action checked when nothing happened.
+		updateSelectSourceMenu();
+		return;
+	}
+
+	if(!QDir(folder + "/rgb_sync").exists() || !QDir(folder + "/depth_sync").exists())
+	{
+		QMessageBox::warning(
+			this,
+			tr("Invalid Unity dataset"),
+			tr("Folder must contain rgb_sync/ and depth_sync/ subfolders:\n%1").arg(folder));
+		updateSelectSourceMenu();
+		return;
+	}
+
+	_preferencesDialog->selectSourceDriver(PreferencesDialog::kSrcRGBDImages);
+	this->statusBar()->showMessage(
+		tr("Source switched to Unity Images: %1 (configure paths in Preferences if first time)").arg(folder),
+		8000);
 }
 
 }
