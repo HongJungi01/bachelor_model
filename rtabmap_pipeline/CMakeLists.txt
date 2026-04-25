@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(rtabmap_unity_bridge)
+project(rtabmap_pipeline)
 
 set(CMAKE_CXX_STANDARD 17)
 
@@ -9,17 +9,16 @@ find_package(RTABMap REQUIRED COMPONENTS core)
 # Find OpenCV (for imshow visualization)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui imgcodecs)
 
-add_executable(rtabmap_unity_offline main.cpp)
+add_executable(rtabmap_pipeline main.cpp)
 
-target_link_libraries(rtabmap_unity_offline
+target_link_libraries(rtabmap_pipeline
     rtabmap::core
     rtabmap::utilite
     ${OpenCV_LIBS}
 )
 
-# Windows: post-build info
 if(WIN32)
-    add_custom_command(TARGET rtabmap_unity_offline POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E echo "Build complete: rtabmap_unity_offline.exe"
+    add_custom_command(TARGET rtabmap_pipeline POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E echo "Build complete: rtabmap_pipeline.exe"
     )
 endif()
