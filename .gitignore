@@ -1,7 +1,6 @@
 # === Build outputs ===
 rtabmap/build/
-rtabmap_2d_pipeline/build/
-rtabmap_unity_bridge/build/
+rtabmap_pipeline/build/
 
 # === vcpkg pre-built dependencies (large, downloadable) ===
 vcpkg_export/
@@ -11,7 +10,7 @@ vcpkg-export.7z
 pugixml-1.15/
 temp_extract_test/
 
-# === RTAB-Map: build에 불필요한 디렉토리 ===
+# === RTAB-Map: build에 불필요한 디렉토리 (실제로도 삭제됨, 아래는 재추가 방어용) ===
 rtabmap/app/android/
 rtabmap/app/ios/
 rtabmap/archive/
@@ -60,5 +59,3 @@ __pycache__/
 # === Environment ===
 .env
 
-# === Legacy ===
-setup_wsl.sh

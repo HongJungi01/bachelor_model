@@ -238,7 +238,7 @@ stream.Read(body, 0, body.Length);
 ### Python 테스트
 
 ```powershell
-cd C:\dev\rtabmap_2d_pipeline
+cd C:\dev\rtabmap_pipeline
 python test_client.py
 ```
 
@@ -353,12 +353,13 @@ C:\dev\
 │   ├── tools/               ← CLI 도구 (calibration, export 등)
 │   └── cmake_modules/       ← CMake Find 모듈
 │
-├── rtabmap_2d_pipeline/     ← 테스트 유틸리티
+├── rtabmap_pipeline/        ← 통합 파이프라인 (live + offline)
+│   ├── main.cpp             ← --source realsense | images
+│   ├── GridPublisher.h      ← TCP/시각화/PGM (live + offline)
 │   ├── test_client.py       ← TCP 수신 테스트 (Python)
-│   ├── main.cpp             ← headless 파이프라인 (참고용)
-│   ├── GridPublisher.h      ← TCP 프로토콜 정의 (참고용)
+│   ├── run_realsense.bat    ← live 모드 단축 스크립트
+│   ├── run_offline.bat      ← offline 모드 단축 스크립트
 │   └── CMakeLists.txt
 │
-├── vcpkg_export/            ← ⬇️ 별도 다운로드 (gitignore)
-└── vcpkg-export.7z          ← ⬇️ 별도 다운로드 (gitignore)
+└── vcpkg_export/            ← ⬇️ RTAB-Map 릴리스 첨부의 vcpkg-export-*.7z 추출 (gitignore)
 ```
