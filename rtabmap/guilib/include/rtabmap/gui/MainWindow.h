@@ -246,6 +246,10 @@ protected Q_SLOTS:
 	void toggleTcpGridStreaming(bool enabled);
 	void onTcpStatusMessage(const QString & msg);
 
+	// One-click source toggle (RealSense D455f ↔ Unity Images dataset)
+	void selectSourceRealSense();
+	void selectSourceUnityImages();
+
 Q_SIGNALS:
 	void statsReceived(const rtabmap::Statistics &);
 	void statsProcessed();
@@ -440,6 +444,11 @@ private:
 	// TCP Grid Streaming
 	GridTcpStreamer * _gridTcpStreamer;
 	QAction * _actionTcpGridStreaming;
+
+	// One-click source toggle (RealSense ↔ Unity Images)
+	QAction * _actionSourceRealSense;
+	QAction * _actionSourceUnityImages;
+	QActionGroup * _sourceToggleGroup;
 };
 
 }
