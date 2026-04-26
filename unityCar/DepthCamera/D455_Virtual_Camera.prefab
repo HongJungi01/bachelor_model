@@ -11,6 +11,8 @@ GameObject:
   - component: {fileID: 3018797797106791623}
   - component: {fileID: 1809315543548549555}
   - component: {fileID: 2144689155266156063}
+  - component: {fileID: 7100000000000000001}
+  - component: {fileID: 7100000000000000002}
   m_Layer: 0
   m_Name: D455_Virtual_Camera
   m_TagString: Untagged
@@ -103,3 +105,36 @@ MonoBehaviour:
   imageHeight: 720
   captureOnStart: 1
   showDepthInGameView: 0
+--- !u!114 &7100000000000000001
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2423543670792273050}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: a3c1f2d8e4b9456789abcdef01234567, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  gyroNoiseStd: 0
+  accelNoiseStd: 0
+  epochRealtime: 0
+--- !u!114 &7100000000000000002
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2423543670792273050}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: b4d2f3e9c5ca567890bcdef012345678, type: 3}
+  m_Name:
+  m_EditorClassIdentifier:
+  serverHost: 127.0.0.1
+  serverPort: 7778
+  rgbd: {fileID: 2144689155266156063}
+  imu: {fileID: 7100000000000000001}
+  reconnectInterval: 2
+  autoReconnect: 1

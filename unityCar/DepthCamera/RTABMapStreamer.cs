@@ -55,6 +55,10 @@ public class RTABMapStreamer : MonoBehaviour
     private volatile bool running;
     private volatile bool calibSent;
 
+    // Calibration은 메인 스레드(Update)에서 캐싱. Unity API는 worker thread에서 사용 불가.
+    private RGBD_DataCollector.Calibration calibCache;
+    private volatile bool calibCached;
+
     private readonly Queue<byte[]> sendQueue   = new Queue<byte[]>(64);
     private readonly object        sendLock    = new object();
     private readonly AutoResetEvent sendSignal = new AutoResetEvent(false);
@@ -93,6 +97,13 @@ public class RTABMapStreamer : MonoBehaviour
     void Update()
     {
         if (!running) return;
+
+        // 메인 스레드에서만 안전한 Unity API 호출 — calibration 캐싱
+        if (!calibCached)
+        {
+            calibCache  = rgbd.GetCalibration();
+            calibCached = true;
+        }
 
         // RGBD 프레임 큐에서 꺼내 패킷화 → 송신 큐
         while (rgbd.TryDequeueFrame(out RGBD_DataCollector.Frame f))
@@ -155,9 +166,15 @@ public class RTABMapStreamer : MonoBehaviour
             // ── 캘리브레이션 (1회) ──
             if (!calibSent)
             {
+                if (!calibCached)
+                {
+                    // 메인 스레드에서 아직 캐싱 전 → 잠시 대기
+                    Thread.Sleep(10);
+                    continue;
+                }
                 try
                 {
-                    byte[] calib = BuildCalibPacket(rgbd.GetCalibration());
+                    byte[] calib = BuildCalibPacket(calibCache);
                     stream.Write(calib, 0, calib.Length);
                     calibSent = true;
                     Debug.Log("[Streamer] calibration sent");
