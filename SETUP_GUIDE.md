@@ -1,6 +1,7 @@
 # 빌드 & 실행 가이드
 
-> RealSense D455f → RTAB-Map SLAM → 2D Occupancy Grid → TCP 스트리밍 (Unity)
+> Unity 가상 D455 → TCP → RTAB-Map (RGB+Depth+IMU) → 3D Map / 2D Occupancy Grid
+> 실 카메라(RealSense2) 모드도 그대로 사용 가능
 >
 > OS: Windows 10/11 | 빌드: Visual Studio 2022 + CMake
 
@@ -10,11 +11,11 @@
 
 1. [사전 조건](#1-사전-조건)
 2. [vcpkg 의존성 설치](#2-vcpkg-의존성-설치)
-3. [RTAB-Map 소스 빌드](#3-rtab-map-소스-빌드)
+3. [RTAB-Map 빌드](#3-rtab-map-빌드)
 4. [실행](#4-실행)
-5. [카메라 연결 & SLAM 시작](#5-카메라-연결--slam-시작)
-6. [TCP Grid Streaming (Unity 연동)](#6-tcp-grid-streaming-unity-연동)
-7. [소스 수정 & 재빌드](#7-소스-수정--재빌드)
+5. [Unity TCP 모드로 SLAM 돌리기](#5-unity-tcp-모드로-slam-돌리기)
+6. [Unity 측 설정 (`unityCar`)](#6-unity-측-설정-unitycar)
+7. [TCP 패킷 검증 도구](#7-tcp-패킷-검증-도구)
 8. [트러블슈팅](#8-트러블슈팅)
 9. [프로젝트 구조](#9-프로젝트-구조)
 
@@ -22,309 +23,255 @@
 
 ## 1. 사전 조건
 
-| 항목          | 버전/사양                       | 설치 방법                                               |
-| ------------- | ------------------------------- | ------------------------------------------------------- |
-| Visual Studio | 2022 Community (MSVC 19.44+)    | [visualstudio.com](https://visualstudio.microsoft.com/) |
-| C++ 워크로드  | "C++를 사용한 데스크톱 개발"    | VS Installer에서 체크                                   |
-| Windows SDK   | 10.0.22621.0 이상               | VS Installer에 포함                                     |
-| 7-Zip         | 최신                            | `choco install 7zip -y`                                 |
-| Git           | 최신                            | `winget install Git.Git`                                |
-| 카메라        | Intel RealSense D455f (USB 3.0) | USB 3.0 포트에 직접 연결                                |
-
-> **CMake**는 VS2022에 번들 포함되어 있어 별도 설치 불필요.
+| 항목          | 버전/사양                            | 비고                                             |
+| ------------- | ------------------------------------ | ------------------------------------------------ |
+| Visual Studio | 2022 Community (MSVC 19.44+)         | "C++를 사용한 데스크톱 개발" 워크로드 포함       |
+| Windows SDK   | 10.0.22621.0 이상                    | VS Installer에 포함                              |
+| CMake         | 3.20+                                | VS2022 번들 사용 가능 (별도 설치 가능)           |
+| Unity         | 2022.3 LTS (DX11)                    | Unity TCP 모드만 사용                            |
+| Python 3.9+   | 검증 도구용                          | numpy, opencv-python (선택)                      |
 
 ---
 
 ## 2. vcpkg 의존성 설치
 
-RTAB-Map 공식 릴리스에서 사전빌드된 vcpkg export를 다운로드한다.
+RTAB-Map 공식 릴리스에서 사전빌드된 vcpkg export를 사용한다 (`C:\dev\vcpkg_export`).
 
 ```powershell
 cd C:\dev
-
-# 다운로드 (~2.5GB)
 $url = "https://github.com/introlab/rtabmap/releases/download/0.23.1/vcpkg-export-66c0373d-x64-vs2022.7z"
 Invoke-WebRequest -Uri $url -OutFile "vcpkg_export.7z"
-
-# 압축 해제
 & "C:\Program Files\7-Zip\7z.exe" x "vcpkg_export.7z" -o"C:\dev\vcpkg_export" -y
 ```
 
-압축 해제 후 `C:\dev\vcpkg_export\installed\x64-windows-release\` 에 라이브러리 설치됨:
+설치 결과 — `C:\dev\vcpkg_export\installed\x64-windows-release\` 에 Qt6, VTK, PCL, OpenCV, librealsense, g2o, Eigen, Boost 등이 들어 있음.
 
-| 라이브러리        | 버전   |
-| ----------------- | ------ |
-| Qt                | 6.10.0 |
-| VTK               | 9.3    |
-| PCL               | 1.15.1 |
-| OpenCV            | 4.12.0 |
-| librealsense      | 2.56.2 |
-| g2o, Eigen, Boost | 최신   |
+> **주의**: `CMAKE_TOOLCHAIN_FILE`로 vcpkg toolchain을 쓰면 manifest mode가 활성화되어 export 패키지의 triplet을 인식 못한다. **반드시 `CMAKE_PREFIX_PATH`만 사용**한다 (아래 빌드 절차).
 
 ---
 
-## 3. RTAB-Map 소스 빌드
+## 3. RTAB-Map 빌드
 
-### 3-1. 소스 가져오기
+### 3-1. Visual Studio 개발자 환경에서 CMake configure
 
-```powershell
-cd C:\dev
-git clone <이 레포 URL> .
-# 또는 이미 있으면:
-# git pull
-```
-
-### 3-2. CMake 구성
+`psapi.lib` 같은 시스템 라이브러리는 VS의 `LIB` 환경변수가 있어야 찾는다. **반드시 `vcvars64.bat` 환경에서** 실행한다.
 
 ```powershell
-$cmakeBin = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
-$vcpkg = "C:\dev\vcpkg_export\installed\x64-windows-release"
-$psapi = "C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64\psapi.lib"
+# PowerShell에서 한 줄로 실행 (vcvars + cmake)
+$vs   = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+$repo = "C:\dev\rtabmap"
+$bld  = "C:\dev\rtabmap\build"
+$pre  = "C:/dev/vcpkg_export/installed/x64-windows-release"
 
-cd C:\dev\rtabmap
-New-Item -ItemType Directory -Force -Path build
-cd build
-
-& $cmakeBin .. `
-  -Wno-dev `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DCMAKE_PREFIX_PATH="$vcpkg" `
-  -DCMAKE_INSTALL_PREFIX="C:\dev\rtabmap\install" `
-  -DWITH_QT=ON `
-  -DBUILD_APP=ON `
-  -DWITH_REALSENSE2=ON `
-  -DBUILD_TOOLS=ON `
-  -DBUILD_EXAMPLES=OFF `
-  -DPSAPI_LIBRARIES="$psapi"
+cmd /c "`"$vs`" && cmake -S $repo -B $bld -G `"Visual Studio 17 2022`" -A x64 ^
+  -DCMAKE_PREFIX_PATH=`"$pre`" ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DBUILD_APP=ON -DBUILD_EXAMPLES=OFF -DBUILD_TOOLS=OFF ^
+  -DWITH_REALSENSE2=ON"
 ```
 
-> ⚠️ `$psapi` 경로의 Windows SDK 버전(`10.0.26100.0`)은 본인 환경에 맞게 수정.
-> 확인: `Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" | Select-Object Name`
-
-CMake 출력에서 확인할 항목:
+성공 시 출력:
 
 ```
---   With RealSense2  = YES
---   With Qt (Qt6)    = YES
---   With VTK         = YES
+-- With Qt (Qt6) = YES
+-- With RealSense2 = YES
+-- Configuring done
+-- Build files have been written to: C:/dev/rtabmap/build
 ```
 
-### 3-3. 빌드
+### 3-2. 빌드
 
 ```powershell
-& $cmakeBin --build . --config Release --parallel
+cmd /c "`"$vs`" && cmake --build $bld --config Release --parallel"
 ```
 
-> 첫 빌드: 약 5~10분 소요 (CPU에 따라 다름)
+소요 시간: 첫 빌드 5~15분, 증분 빌드는 수정 파일에 따라 10초~3분.
 
-빌드 완료 시:
+빌드 산출물:
 
 ```
-rtabmap_app.vcxproj -> C:\dev\rtabmap\build\bin\RTABMap.exe
+C:\dev\rtabmap\build\bin\RTABMap.exe
+C:\dev\rtabmap\build\bin\rtabmap_core.dll
+C:\dev\rtabmap\build\bin\rtabmap_gui.dll
 ```
+
+### 3-3. ⚠️ 빌드 실패 시 확인 — stub 헤더 정리
+
+이전 세션에서 누군가 임시로 만든 stub `*_export.h` / `Version.h`가 **source tree**에 남아 있으면 CMake가 자동 생성한 정확한 헤더를 가려서 다음 에러가 난다:
+
+```
+error C2491: 'ULogger::instance_': dllimport 정적 데이터 멤버를 정의할 수 없습니다.
+error C2065: 'RTABMAP_PCL_INDEX': 선언되지 않은 식별자입니다.
+```
+
+해결 — 다음 stub들이 **untracked 상태로** 있으면 삭제 (CMake가 build 디렉토리에 정확한 버전을 자동 생성한다):
+
+```powershell
+Remove-Item -Force `
+  C:\dev\rtabmap\corelib\include\rtabmap\core\rtabmap_core_export.h, `
+  C:\dev\rtabmap\corelib\include\rtabmap\core\Version.h, `
+  C:\dev\rtabmap\utilite\include\rtabmap\utilite\utilite_export.h, `
+  C:\dev\rtabmap\utilite\include\rtabmap\utilite\rtabmap_utilite_export.h `
+  -ErrorAction SilentlyContinue
+```
+
+그리고 `rtabmap/build` 디렉토리의 `CMakeCache.txt`/`CMakeFiles`가 손상돼 보이면 (configure가 dependencies를 못 찾음) 그 둘만 삭제하고 3-1부터 재실행한다 (`build/bin`은 보존됨).
 
 ---
 
 ## 4. 실행
 
-### 방법 A: 배치 파일 (추천)
-
 ```powershell
 C:\dev\run_rtabmap.bat
 ```
 
-더블클릭 또는 PowerShell에서 실행.
+`run_rtabmap.bat`이 PATH (vcpkg bin + rtabmap bin), `QT_PLUGIN_PATH`를 잡아주고 GUI를 띄운다.
 
-### 방법 B: PowerShell 직접 실행
-
-```powershell
-$env:PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\bin;C:\dev\rtabmap\build\bin;$env:PATH"
-$env:QT_PLUGIN_PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\Qt6\plugins"
-& "C:\dev\rtabmap\build\bin\RTABMap.exe"
-```
-
-### GUI 패널 구성
-
-| 패널         | 내용                                |
-| ------------ | ----------------------------------- |
-| 3D Map       | 3D 포인트클라우드 + 카메라 경로     |
-| Graph View   | **2D Occupancy Grid** (점유 그리드) |
-| Loop Closure | 루프 클로저 탐지 시각화             |
-| Odometry     | 프레임간 특징점 매칭                |
+GUI 패널: **3D Map**, **Graph view (2D occupancy grid)**, **Loop closure detection**, **Odometry**.
 
 ---
 
-## 5. 카메라 연결 & SLAM 시작
+## 5. Unity TCP 모드로 SLAM 돌리기
 
-1. RealSense D455f를 **PC USB 3.0 포트에 직접 연결** (허브 사용 금지)
-2. RTABMap 실행
-3. **Edit → Preferences → Source type** 섹션:
-   - Camera → `RealSense2` 선택
-   - OK
-4. **Detection → Start (▶)** 클릭
-5. 카메라를 들고 천천히 이동 → 3D Map + 2D Grid 실시간 생성
+### 5-1. RTABMap 설정 (한 번만)
 
-### 자동 적용되는 D455f 최적 파라미터
+`Edit → Preferences → Source`:
 
-Start 시 `getCustomParameters()`에서 자동 적용됨 (별도 설정 불필요):
+| 설정 | 값 |
+|------|-----|
+| Source type | **RGB-D** |
+| Driver | **Unity TCP** |
+| Unity TCP Camera → Listen Port | **7778** |
+| Input rate | 0.0 Hz (= as fast as possible) |
 
-| 파라미터                 | 값     | 의미                       |
-| ------------------------ | ------ | -------------------------- |
-| `Grid/CellSize`          | `0.05` | 5cm 해상도                 |
-| `Grid/RangeMax`          | `6.0`  | D455f depth 상한 6m        |
-| `Grid/RangeMin`          | `0.3`  | D455f depth 하한 0.3m      |
-| `Grid/RayTracing`        | `true` | 센서~장애물 사이 free 마킹 |
-| `Grid/DepthDecimation`   | `2`    | 해상도 2배 축소 (성능)     |
-| `Grid/MaxObstacleHeight` | `1.5`  | 1.5m 이상 장애물 무시      |
-| `Grid/MaxGroundHeight`   | `0.15` | 바닥 판정 최대 15cm        |
-| `Optimizer/GravitySigma` | `0.3`  | IMU gravity constraint     |
-| `Odom/AlignWithGround`   | `true` | IMU 기반 중력 정렬         |
-| `Reg/Strategy`           | `0`    | Visual registration        |
-| `Vis/MinInliers`         | `15`   | 최소 inlier 수             |
+Apply → OK.
 
----
+### 5-2. Unity 씬 준비 ([6절](#6-unity-측-설정-unitycar) 참고)
 
-## 6. TCP Grid Streaming (Unity 연동)
+`unityCar` 패키지를 Unity 프로젝트 `Assets/`에 복사하고 `Car 1.prefab`을 씬에 배치.
 
-### 활성화
+### 5-3. 실행 순서 (자유)
 
-1. RTABMap GUI에서 **Tools → TCP Grid Streaming (port 7777)** 체크
-2. 상태바에 "TCP Grid Streaming: listening on port 7777" 표시
-3. Start(▶)로 SLAM 시작 → 클라이언트에 자동 전송 (10Hz)
+`init()`이 non-blocking이므로 어느 쪽을 먼저 켜도 자동 연결된다.
 
-### 패킷 프로토콜 (little-endian)
+1. RTABMap **Start (▶)** — Console에 `listening on port 7778 (Unity may connect anytime)`
+2. Unity **Play** — Unity Console에 `[Streamer] connected → 127.0.0.1:7778` + `calibration sent`
+3. RTABMap의 3D Map / Graph view에 SLAM 결과가 실시간으로 그려진다
 
-```
-[Header 32 bytes]
-  int32  width       — 그리드 가로 셀 수
-  int32  height      — 그리드 세로 셀 수
-  float  xMin        — 왼쪽 하단 X좌표 (m)
-  float  yMin        — 왼쪽 하단 Y좌표 (m)
-  float  cellSize    — 셀 크기 (m, 기본 0.05)
-  float  poseX       — 로봇 X좌표 (m)
-  float  poseY       — 로봇 Y좌표 (m)
-  float  poseYaw     — 로봇 방향 (rad)
+### 5-4. 휘는 맵 (drift) 보정 — Loop closure 임계값 조정
 
-[Body: width × height bytes]
-  int8 per cell: -1=unknown, 0=free, 100=obstacle
-```
+지하주차장처럼 시각적으로 반복되는 환경은 loop closure가 거부되기 쉽다 (`Loop hypothesis N rejected!` 메시지). Preferences에서:
 
-### 좌표 변환
-
-```
-gridX = (poseX - xMin) / cellSize
-gridY = (poseY - yMin) / cellSize
-```
-
-### Unity C# 예시
-
-```csharp
-TcpClient client = new TcpClient("127.0.0.1", 7777);
-NetworkStream stream = client.GetStream();
-
-byte[] header = new byte[32];
-stream.Read(header, 0, 32);
-
-int width  = BitConverter.ToInt32(header, 0);
-int height = BitConverter.ToInt32(header, 4);
-float xMin = BitConverter.ToSingle(header, 8);
-// ...
-
-byte[] body = new byte[width * height];
-stream.Read(body, 0, body.Length);
-// body[i]: -1=unknown, 0=free, 100=obstacle
-```
-
-### Python 테스트
-
-```powershell
-cd C:\dev\rtabmap_pipeline
-python test_client.py
-```
+| 파라미터 | 기본값 | 추천 |
+|---|---|---|
+| `Rtabmap/LoopThr` | 0.11 | **0.05** |
+| `RGBD/ProximityBySpace` | true | true |
+| `RGBD/ProximityMaxGraphDepth` | 50 | **0** (무제한) |
+| `RGBD/ProximityPathFilteringRadius` | 1.0 | **2.0** |
+| `Vis/MinInliers` | 20 | **15** |
+| `RGBD/OptimizeMaxError` | 3.0 | **0** (무제한) |
 
 ---
 
-## 7. 소스 수정 & 재빌드
+## 6. Unity 측 설정 (`unityCar`)
 
-### 우리가 수정/추가한 파일
+`c:\dev\unityCar` 디렉토리는 그대로 Unity 자산 패키지로 사용 가능 (`.meta` 포함).
 
-| 파일                                           | 내용                                               |
-| ---------------------------------------------- | -------------------------------------------------- |
-| `guilib/include/rtabmap/gui/GridTcpStreamer.h` | **신규** — TCP 서버 클래스 (QTcpServer 기반)       |
-| `guilib/src/GridTcpStreamer.cpp`               | **신규** — 구현 (멀티 클라이언트, 10Hz rate limit) |
-| `guilib/include/rtabmap/gui/MainWindow.h`      | 수정 — 멤버 변수, 슬롯, getCustomParameters 선언   |
-| `guilib/src/MainWindow.cpp`                    | 수정 — TCP 통합, D455f 파라미터, Graph View 기본   |
-| `guilib/src/CMakeLists.txt`                    | 수정 — GridTcpStreamer 등록 + Qt6::Network 추가    |
+### 6-1. 폴더 통째로 import
 
-### 빠른 재빌드 (GUI만)
+1. 기존 Unity 프로젝트의 `Assets/Car/`가 있으면 **삭제** (구버전 GUID 충돌 방지)
+2. `c:\dev\unityCar` 폴더를 `Assets/`로 통째로 복사 → `Assets/unityCar/`
+3. Unity 자동 import 대기
 
-```powershell
-$cmakeBin = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
-cd C:\dev\rtabmap\build
+### 6-2. 씬에 배치
 
-# GUI 라이브러리만 재빌드 (~30초)
-& $cmakeBin --build . --config Release --target rtabmap_gui --parallel
+`Assets/unityCar/Car 1.prefab`을 Hierarchy로 드래그.
 
-# 앱도 재빌드 (~10초)
-& $cmakeBin --build . --config Release --target rtabmap_app --parallel
+자식 `D455_Virtual_Camera` GameObject에 다음 3개 스크립트가 자동 attach 되어 있어야 함:
+
+- **RGBD_Data Collector** — RGB+Depth 캡처 (1280×720 @ 10fps)
+- **IMU Sensor** — gyro/accel (rad/s, m/s², body frame)
+- **RTAB Map Streamer** — TCP 클라이언트 (host=127.0.0.1, port=7778)
+
+### 6-3. 패킷 프로토콜 (참고)
+
+```
+Header (5B): [type:u8][payloadSize:u32]   ── little-endian
+  Type 1 Calib (136B):   w(u32) h(u32) fx fy cx cy(f64×4) localTransform(f64×12)
+  Type 2 IMU   (56B):    stamp(f64) gx,gy,gz(f64) ax,ay,az(f64)
+  Type 3 RGBD:           stamp(f64) w(u32) h(u32) rgb[W*H*3] depth[W*H*2 mm uint16]
 ```
 
-### 새 소스 파일 추가 시
+좌표계:
+- RGB/Depth: top-left origin (OpenCV)
+- Calibration `localTransform`: optical(X-right,Y-down,Z-forward) → base_link(X-forward,Y-left,Z-up)
+- IMU: Unity body frame (X-right, Y-up, Z-forward) → rtabmap이 base_link로 회전
 
-1. `guilib/src/CMakeLists.txt` 에 헤더/소스 등록
-2. CMake 재구성 + 전체 빌드:
+---
+
+## 7. TCP 패킷 검증 도구
+
+Unity 측만 단독으로 시험하려면 (rtabmap 끄고) Python 서버를 사용한다.
 
 ```powershell
-& $cmakeBin .. -Wno-dev
-& $cmakeBin --build . --config Release --parallel
+# 콘솔만
+python C:\dev\test_unity_tcp.py
+
+# RGB / Depth 시각화
+python C:\dev\test_unity_tcp.py --show
 ```
+
+정상 출력 예시:
+
+```
+[server] listening on 0.0.0.0:7778
+[server] client connected from ('127.0.0.1', 5xxxx)
+[Calib #1]
+  size = 1280 x 720
+  fx=648.93 fy=648.93 cx=640.00 cy=360.00
+  localTransform: [[ 0  0  1  0][−1  0  0  0][ 0 −1  0  0]]
+[IMU #1] t=0.012s gyro=(...) accel=(0, 9.81, 0) |a|=9.81 m/s²
+[RGBD #1] t=0.123s 1280x720 payload=4608016B [OK]
+--- stats: 5s Calib=1 IMU=234 (46 Hz) RGBD=68 (13.6 fps) ---
+```
+
+`Calib`이 한 번 오고 그 후 IMU/RGBD가 계속 흐르면 Unity 측은 정상.
 
 ---
 
 ## 8. 트러블슈팅
 
-### Qt platform plugin 에러
+### 빌드: `psapi.lib`를 못 찾음
 
-```
-qt.qpa.plugin: Could not find the Qt platform plugin "windows" in ""
-```
+→ vcvars64.bat 환경에서 cmake를 실행 안 한 경우. [3-1](#3-1-visual-studio-개발자-환경에서-cmake-configure) 참고.
 
-→ `QT_PLUGIN_PATH` 설정 필요. `run_rtabmap.bat` 사용 추천.
+### 빌드: dllimport C2491 에러 / `RTABMAP_PCL_INDEX` 미정의
 
-```powershell
-$env:QT_PLUGIN_PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\Qt6\plugins"
-```
+→ source tree에 stub `*_export.h` / `Version.h`가 남아 generated 헤더를 가리는 경우. [3-3](#3-3-️-빌드-실패-시-확인--stub-헤더-정리) 참고.
 
-### DLL을 찾을 수 없음
+### 빌드: `LNK1104: rtabmap_gui.dll 파일을 열 수 없습니다`
 
-```
-The code execution cannot proceed because XXX.dll was not found
-```
+→ RTABMap.exe가 실행 중이라 dll을 못 덮어씀. RTABMap을 닫고 재빌드.
 
-→ PATH에 DLL 경로 추가:
+### 실행: Qt platform plugin 에러
 
-```powershell
-$env:PATH = "C:\dev\vcpkg_export\installed\x64-windows-release\bin;C:\dev\rtabmap\build\bin;$env:PATH"
-```
+→ `QT_PLUGIN_PATH`가 비어 있음. `run_rtabmap.bat`을 사용하거나 직접 환경변수 설정.
 
-### psapi.lib 링크 에러
+### Unity TCP: `[Streamer] connected`만 반복, `calibration sent`가 안 뜸
 
-```
-LINK : fatal error LNK1181: cannot open input file 'psapi.lib'
-```
+→ 이전 버그. RTABMapStreamer가 worker thread에서 Unity API를 호출했음. 최신 버전은 메인 스레드에서 calibration을 캐싱하므로 unityCar를 최신본으로 갱신.
 
-→ CMake 구성 시 Windows SDK 버전 확인 후 경로 수정:
+### Unity TCP: rtabmap이 응답 없음 (Start 직후)
 
-```powershell
-Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" | Select-Object Name
-# → 본인 버전으로 $psapi 경로 업데이트
-```
+→ 이전 버그. `init()`이 메인 스레드에서 calibration을 무한 대기했음. 최신 버전은 non-blocking — rtabmap_core.dll을 다시 빌드해서 갱신.
 
-### RealSense 카메라 미감지
+### Unity TCP: `RTAB-Map: Camera initialization failed`
 
-- USB 3.0 포트에 **직접** 연결 (허브 사용 금지)
-- 케이블 뺐다 다시 꽂기
-- 장치 관리자에서 "Intel RealSense D455" 인식 확인
+→ 30초 timeout 버전을 쓰고 있음. 위와 같은 fix 적용된 build로 교체.
+
+### SLAM: 한 바퀴 돌면 맵이 휨
+
+→ Loop closure가 거부되고 있음. [5-4](#5-4-휘는-맵-drift-보정--loop-closure-임계값-조정) 참고.
 
 ---
 
@@ -332,34 +279,41 @@ Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" | Select-Object Name
 
 ```
 C:\dev\
-├── .gitignore
-├── run_rtabmap.bat          ← 실행 배치 파일
-├── plan.md                  ← 프로젝트 계획
-├── SETUP_GUIDE.md           ← 이 문서
+├── run_rtabmap.bat              ← RTABMap GUI 실행
+├── test_unity_tcp.py            ← Unity TCP 검증용 Python 서버
+├── SETUP_GUIDE.md               ← 이 문서
 │
-├── rtabmap/                 ← RTAB-Map 0.23.4 소스 (수정됨)
-│   ├── CMakeLists.txt
-│   ├── app/src/main.cpp     ← RTABMap.exe 진입점
-│   ├── corelib/             ← SLAM 엔진
-│   ├── guilib/              ← Qt GUI (★ 우리 수정 여기)
-│   │   ├── include/rtabmap/gui/
-│   │   │   ├── GridTcpStreamer.h    ★ 신규
-│   │   │   └── MainWindow.h        ★ 수정
+├── rtabmap/                     ← RTAB-Map 0.23.4 (Unity TCP 통합)
+│   ├── corelib/
+│   │   ├── include/rtabmap/core/
+│   │   │   ├── CameraRGBD.h           (Unity TCP include 추가)
+│   │   │   └── camera/CameraUnityTCP.h  ★ 신규
 │   │   └── src/
-│   │       ├── GridTcpStreamer.cpp  ★ 신규
-│   │       ├── MainWindow.cpp      ★ 수정
-│   │       └── CMakeLists.txt      ★ 수정
-│   ├── utilite/             ← 유틸리티 라이브러리
-│   ├── tools/               ← CLI 도구 (calibration, export 등)
-│   └── cmake_modules/       ← CMake Find 모듈
+│   │       ├── CMakeLists.txt          (camera/CameraUnityTCP.cpp 등록)
+│   │       └── camera/CameraUnityTCP.cpp  ★ 신규
+│   ├── guilib/
+│   │   ├── include/rtabmap/gui/
+│   │   │   └── PreferencesDialog.h     (kSrcUnityTCP enum 추가)
+│   │   └── src/
+│   │       ├── PreferencesDialog.cpp   (Unity TCP 항목/페이지 visibility)
+│   │       └── ui/preferencesDialog.ui  (Unity TCP page + Listen Port spinbox)
+│   └── build/                   ← cmake build (gitignore)
 │
-├── rtabmap_pipeline/        ← 통합 파이프라인 (live + offline)
-│   ├── main.cpp             ← --source realsense | images
-│   ├── GridPublisher.h      ← TCP/시각화/PGM (live + offline)
-│   ├── test_client.py       ← TCP 수신 테스트 (Python)
-│   ├── run_realsense.bat    ← live 모드 단축 스크립트
-│   ├── run_offline.bat      ← offline 모드 단축 스크립트
-│   └── CMakeLists.txt
+├── rtabmap_pipeline/            ← 별도 standalone binary (RealSense / Unity TCP)
+│   ├── main.cpp
+│   ├── CameraUnityTCP.h
+│   └── ...
 │
-└── vcpkg_export/            ← ⬇️ RTAB-Map 릴리스 첨부의 vcpkg-export-*.7z 추출 (gitignore)
+├── unityCar/                    ← Unity 자산 (그대로 Assets/에 복사)
+│   ├── Car 1.prefab
+│   ├── CarController.cs
+│   └── DepthCamera/
+│       ├── D455_Virtual_Camera.prefab   (RGBD/IMU/Streamer 컴포넌트 포함)
+│       ├── DepthGrayscale.shader
+│       ├── DepthMaterial.mat
+│       ├── RGBD_DataCollector.cs
+│       ├── IMUSensor.cs
+│       └── RTABMapStreamer.cs
+│
+└── vcpkg_export/                ← (gitignore) RTAB-Map 릴리스 첨부 추출
 ```
