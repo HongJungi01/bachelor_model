@@ -96,7 +96,7 @@ public:
 		recvThread_ = std::thread(&CameraUnityTCP::recvLoop, this);
 
 		// Wait for the first calibration packet (max 30s)
-		UINFO("CameraUnityTCP: waiting for Unity to connect on port %d…", listenPort_);
+		UINFO("CameraUnityTCP: waiting for Unity to connect on port %d...", listenPort_);
 		std::unique_lock<std::mutex> lk(calibMtx_);
 		bool ok = calibCv_.wait_for(lk, std::chrono::seconds(30),
 		                            [this]{ return calibrated_.load() || !running_.load(); });

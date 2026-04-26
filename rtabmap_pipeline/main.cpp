@@ -131,7 +131,7 @@ static int runLive(const std::string & dbPath,
 
 	UEventsManager::createPipe(&cameraThread, &odomThread, "SensorEvent");
 
-	UINFO("Starting pipeline…");
+	UINFO("Starting pipeline...");
 	rtabmapThread.start();
 	odomThread.start();
 	cameraThread.start();
@@ -146,7 +146,7 @@ static int runLive(const std::string & dbPath,
 	while (g_running)
 		uSleep(100);
 
-	printf("\nShutting down…\n");
+	printf("\nShutting down...\n");
 
 	gridPublisher.setRunning(false);
 	gridPublisher.unregisterFromEventsManager();
