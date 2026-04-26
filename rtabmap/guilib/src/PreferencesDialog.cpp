@@ -414,6 +414,16 @@ PreferencesDialog::PreferencesDialog(QWidget * parent) :
 	{
 		_ui->comboBox_cameraRGBD->setItemData(kSrcOrbbecSDK - kSrcRGBD, 0, Qt::UserRole - 1);
 	}
+	// Ensure Unity TCP item exists in combobox (in case UI file wasn't updated)
+	while(_ui->comboBox_cameraRGBD->count() <= kSrcUnityTCP - kSrcRGBD)
+	{
+		_ui->comboBox_cameraRGBD->addItem(QString());
+	}
+	_ui->comboBox_cameraRGBD->setItemText(kSrcUnityTCP - kSrcRGBD, "Unity TCP");
+	if (!CameraUnityTCP::available())
+	{
+		_ui->comboBox_cameraRGBD->setItemData(kSrcUnityTCP - kSrcRGBD, 0, Qt::UserRole - 1);
+	}
 	if (!CameraRealSense::available())
 	{
 		_ui->comboBox_cameraRGBD->setItemData(kSrcRealSense - kSrcRGBD, 0, Qt::UserRole - 1);
@@ -2819,6 +2829,10 @@ void PreferencesDialog::readCameraSettings(const QString & filePath)
 	_ui->checkBox_orbbec_sdk_depth_mm->setChecked(settings.value("depth_mm", _ui->checkBox_orbbec_sdk_depth_mm->isChecked()).toBool());
 	settings.endGroup(); // Orbbec SDK
 
+	settings.beginGroup("UnityTCP");
+	_ui->spinBox_unityTCP_port->setValue(settings.value("port", _ui->spinBox_unityTCP_port->value()).toInt());
+	settings.endGroup(); // UnityTCP
+
 	settings.beginGroup("RealSense");
 	_ui->comboBox_realsensePresetRGB->setCurrentIndex(settings.value("presetRGB", _ui->comboBox_realsensePresetRGB->currentIndex()).toInt());
 	_ui->comboBox_realsensePresetDepth->setCurrentIndex(settings.value("presetDepth", _ui->comboBox_realsensePresetDepth->currentIndex()).toInt());
@@ -3442,6 +3456,10 @@ void PreferencesDialog::writeCameraSettings(const QString & filePath) const
 	settings.setValue("enable_imu", _ui->checkBox_orbbec_sdk_imu->isChecked());
 	settings.setValue("depth_mm", _ui->checkBox_orbbec_sdk_depth_mm->isChecked());
 	settings.endGroup(); // Orbbec SDK
+
+	settings.beginGroup("UnityTCP");
+	settings.setValue("port", _ui->spinBox_unityTCP_port->value());
+	settings.endGroup(); // UnityTCP
 
 	settings.beginGroup("RealSense");
 	settings.setValue("presetRGB",           _ui->comboBox_realsensePresetRGB->currentIndex());
@@ -5912,12 +5930,14 @@ void PreferencesDialog::updateSourceGrpVisibility()
 			 _ui->comboBox_cameraRGBD->currentIndex() == kSrcRGBDImages-kSrcRGBD ||
 			 _ui->comboBox_cameraRGBD->currentIndex() == kSrcOpenNI_PCL-kSrcRGBD ||
 			 _ui->comboBox_cameraRGBD->currentIndex() == kSrcRealSense2-kSrcRGBD ||
-			 _ui->comboBox_cameraRGBD->currentIndex() == kSrcSeerSense-kSrcRGBD));
+			 _ui->comboBox_cameraRGBD->currentIndex() == kSrcSeerSense-kSrcRGBD ||
+			 _ui->comboBox_cameraRGBD->currentIndex() == kSrcUnityTCP-kSrcRGBD));
 	_ui->groupBox_openni2->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcOpenNI2-kSrcRGBD);
 	_ui->groupBox_freenect2->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcFreenect2-kSrcRGBD);
 	_ui->groupBox_k4w2->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcK4W2 - kSrcRGBD);
 	_ui->groupBox_k4a->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcK4A - kSrcRGBD);
 	_ui->groupBox_orbbec_sdk->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcOrbbecSDK - kSrcRGBD);
+	_ui->groupBox_unityTCP->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcUnityTCP - kSrcRGBD);
 	_ui->groupBox_realsense->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcRealSense - kSrcRGBD);
 	_ui->groupBox_realsense2->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcRealSense2 - kSrcRGBD);
 	_ui->groupBox_cameraRGBDImages->setVisible(_ui->comboBox_sourceType->currentIndex() == 0 && _ui->comboBox_cameraRGBD->currentIndex() == kSrcRGBDImages-kSrcRGBD);
@@ -6841,6 +6861,19 @@ Camera * PreferencesDialog::createCamera(
 		((CameraOrbbecSDK*)camera)->enableColorRectification(_ui->checkBox_orbbec_sdk_color_rectification->isChecked());
 		((CameraOrbbecSDK*)camera)->enableImu(_ui->checkBox_orbbec_sdk_imu->isChecked());
 		((CameraOrbbecSDK*)camera)->enableDepthMM(_ui->checkBox_orbbec_sdk_depth_mm->isChecked());
+
+		camera->setInterIMUPublishing(
+			_ui->checkbox_publishInterIMU->isChecked(),
+			_ui->checkbox_publishInterIMU->isChecked() && getIMUFilteringStrategy()>0?
+					IMUFilter::create((IMUFilter::Type)(getIMUFilteringStrategy()-1), this->getAllParameters()):0,
+					getIMUFilteringBaseFrameConversion());
+	}
+	else if (driver == kSrcUnityTCP)
+	{
+		camera = new CameraUnityTCP(
+			_ui->spinBox_unityTCP_port->value(),
+			this->getGeneralInputRate(),
+			this->getSourceLocalTransform());
 
 		camera->setInterIMUPublishing(
 			_ui->checkbox_publishInterIMU->isChecked(),

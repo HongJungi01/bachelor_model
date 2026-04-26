@@ -3570,6 +3570,11 @@ when using the file type, logs are saved in LogRtabmap.txt (located in the worki
                                     <string>Orbbec SDK</string>
                                    </property>
                                   </item>
+                                  <item>
+                                   <property name="text">
+                                    <string>Unity TCP</string>
+                                   </property>
+                                  </item>
                                  </widget>
                                 </item>
                                 <item row="0" column="1">
@@ -5308,6 +5313,52 @@ when using the file type, logs are saved in LogRtabmap.txt (located in the worki
                                   </item>
                                   <item>
                                    <spacer name="verticalSpacer_32">
+                                    <property name="orientation">
+                                     <enum>Qt::Vertical</enum>
+                                    </property>
+                                    <property name="sizeHint" stdset="0">
+                                     <size>
+                                      <width>0</width>
+                                      <height>0</height>
+                                     </size>
+                                    </property>
+                                   </spacer>
+                                  </item>
+                                 </layout>
+                                </widget>
+                                <widget class="QWidget" name="page_101">
+                                 <layout class="QVBoxLayout" name="verticalLayout_unityTCP_page">
+                                  <item>
+                                   <widget class="QGroupBox" name="groupBox_unityTCP">
+                                    <property name="title">
+                                     <string>Unity TCP Camera</string>
+                                    </property>
+                                    <layout class="QGridLayout" name="gridLayout_unityTCP" columnstretch="0,1">
+                                     <item row="0" column="0">
+                                      <widget class="QLabel" name="label_unityTCP_port">
+                                       <property name="text">
+                                        <string>Listen Port:</string>
+                                       </property>
+                                      </widget>
+                                     </item>
+                                     <item row="0" column="1">
+                                      <widget class="QSpinBox" name="spinBox_unityTCP_port">
+                                       <property name="minimum">
+                                        <number>1</number>
+                                       </property>
+                                       <property name="maximum">
+                                        <number>65535</number>
+                                       </property>
+                                       <property name="value">
+                                        <number>7778</number>
+                                       </property>
+                                      </widget>
+                                     </item>
+                                    </layout>
+                                   </widget>
+                                  </item>
+                                  <item>
+                                   <spacer name="verticalSpacer_184">
                                     <property name="orientation">
                                      <enum>Qt::Vertical</enum>
                                     </property>

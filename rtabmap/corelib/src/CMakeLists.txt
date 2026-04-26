@@ -42,7 +42,8 @@ SET(SRC_FILES
     camera/CameraDepthAI.cpp
 	camera/CameraSeerSense.cpp
 	camera/CameraOrbbecSDK.cpp
-    
+	camera/CameraUnityTCP.cpp
+
     EpipolarGeometry.cpp
     VisualWord.cpp
     VWDictionary.cpp
