@@ -17,17 +17,25 @@ list(APPEND CMAKE_PREFIX_PATH
 # Find OpenCV first
 find_package(OpenCV REQUIRED COMPONENTS core imgproc highgui imgcodecs)
 
+# JSON for the semantic VLM sidecar (cpp-httplib is header-only and lives at
+# ${VCPKG_PATH}/include/httplib.h — already covered by target_include_directories).
+find_package(nlohmann_json CONFIG REQUIRED)
+
 # Link against RTABMap libraries directly
 add_executable(rtabmap_pipeline
     main.cpp
     GridPublisher.h
     CameraUnityTCP.h
+    SemanticBackproject.h
+    SemanticMaskStore.h
+    SemanticWorker.h
 )
 
 target_include_directories(rtabmap_pipeline PRIVATE
     "${RTABMAP_PATH}/corelib/include"
     "${RTABMAP_PATH}/utilite/include"
-    "${RTABMAP_PATH}/build/corelib/include"
+    "${RTABMAP_PATH}/build/corelib/src/include"   # generated rtabmap_core_export.h, Version.h
+    "${RTABMAP_PATH}/build/utilite/src/include"   # generated utilite_export.h
     "${VCPKG_PATH}/include"
     "${VCPKG_PATH}/include/eigen3"
     "${VCPKG_PATH}/include/opencv4"
@@ -37,6 +45,7 @@ target_link_libraries(rtabmap_pipeline
     "${RTABMAP_PATH}/build/lib/rtabmap_core.lib"
     "${RTABMAP_PATH}/build/lib/rtabmap_utilite.lib"
     ${OpenCV_LIBS}
+    nlohmann_json::nlohmann_json
     # Additional PCL and other dependencies that rtabmap_core may need
     "${VCPKG_PATH}/lib/pcl_common.lib"
     "${VCPKG_PATH}/lib/pcl_io.lib"

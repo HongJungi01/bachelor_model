@@ -96,7 +96,10 @@ static ParametersMap makeParams(bool hasIMU)
 // ═══════════════════════════════════════════════════════════════
 static int runLive(const std::string & dbPath,
                    const std::string & outputDir,
-                   int tcpPort)
+                   int tcpPort,
+                   bool enableSemantic,
+                   SemanticWorker::Mode semanticMode,
+                   const std::string & semanticUrl)
 {
 	if (!CameraRealSense2::available())
 	{
@@ -123,7 +126,8 @@ static int runLive(const std::string & dbPath,
 	rtabmap->init(params, dbPath);
 	RtabmapThread rtabmapThread(rtabmap);
 
-	GridPublisher gridPublisher(tcpPort, 0.1, outputDir);
+	GridPublisher gridPublisher(tcpPort, 0.1, outputDir,
+	                            semanticMode, semanticUrl, enableSemantic);
 
 	odomThread.registerToEventsManager();
 	rtabmapThread.registerToEventsManager();
@@ -169,9 +173,12 @@ static int runLive(const std::string & dbPath,
 static int runUnity(const std::string & dbPath,
                     const std::string & outputDir,
                     int gridTcpPort,
-                    int sensorTcpPort)
+                    int sensorTcpPort,
+                    bool enableSemantic,
+                    SemanticWorker::Mode semanticMode,
+                    const std::string & semanticUrl)
 {
-	CameraUnityTCP * camera = new CameraUnityTCP(sensorTcpPort, 0.0f);
+	UnityTcpCameraLocal * camera = new UnityTcpCameraLocal(sensorTcpPort, 0.0f);
 	if (!camera->init())
 	{
 		UERROR("CameraUnityTCP init failed (no client connected within timeout).");
@@ -189,7 +196,8 @@ static int runUnity(const std::string & dbPath,
 	Rtabmap rtabmap;
 	rtabmap.init(params, dbPath);
 
-	GridPublisher gridPublisher(gridTcpPort, 0.0, outputDir);
+	GridPublisher gridPublisher(gridTcpPort, 0.0, outputDir,
+	                            semanticMode, semanticUrl, enableSemantic);
 
 	printf("=== RTAB-Map Pipeline (Unity TCP) ===\n");
 	printf("  Sensor: 127.0.0.1:%d (RGB+Depth+IMU in)\n", sensorTcpPort);
@@ -203,7 +211,7 @@ static int runUnity(const std::string & dbPath,
 	int odomLost    = 0;
 	UTimer totalTimer;
 
-	auto * unityCam = static_cast<CameraUnityTCP *>(cameraThread.camera());
+	auto * unityCam = static_cast<UnityTcpCameraLocal *>(cameraThread.camera());
 
 	SensorCaptureInfo cameraInfo;
 	SensorData data = cameraThread.camera()->takeData(&cameraInfo);
@@ -289,6 +297,8 @@ static void printUsage()
 		"  --output <dir>                  PGM/YAML output directory (default: output)\n"
 		"  --tcp-port <port>               Grid TCP port (default: 7777)\n"
 		"  --sensor-port <port>            Unity sensor TCP port (default: 7778)\n"
+		"  --semantic mock                 Enable semantic worker with hardcoded mock mask\n"
+		"  --semantic-url <url>            Enable semantic worker with HTTP backend (Phase 5+)\n"
 		"\n"
 	);
 }
@@ -302,11 +312,14 @@ int main(int argc, char * argv[])
 	ULogger::setLevel(ULogger::kInfo);
 
 	enum Source { SRC_NONE, SRC_REALSENSE, SRC_UNITY };
-	Source      source        = SRC_NONE;
+	Source      source           = SRC_NONE;
 	std::string dbPath;
 	std::string outputDir;
-	int         gridTcpPort   = 7777;
-	int         sensorTcpPort = 7778;
+	int         gridTcpPort      = 7777;
+	int         sensorTcpPort    = 7778;
+	bool        enableSemantic   = false;
+	SemanticWorker::Mode semanticMode = SemanticWorker::Mode::Mock;
+	std::string semanticUrl;
 
 	for (int i = 1; i < argc; ++i)
 	{
@@ -326,6 +339,26 @@ int main(int argc, char * argv[])
 		else if (strcmp(argv[i], "--output") == 0      && i + 1 < argc) outputDir     = argv[++i];
 		else if (strcmp(argv[i], "--tcp-port") == 0    && i + 1 < argc) gridTcpPort   = std::atoi(argv[++i]);
 		else if (strcmp(argv[i], "--sensor-port") == 0 && i + 1 < argc) sensorTcpPort = std::atoi(argv[++i]);
+		else if (strcmp(argv[i], "--semantic") == 0    && i + 1 < argc)
+		{
+			std::string mode = argv[++i];
+			if (mode == "mock")
+			{
+				enableSemantic = true;
+				semanticMode   = SemanticWorker::Mode::Mock;
+			}
+			else
+			{
+				UERROR("Unknown semantic mode: %s (expected 'mock'). Use --semantic-url for HTTP.", mode.c_str());
+				return 1;
+			}
+		}
+		else if (strcmp(argv[i], "--semantic-url") == 0 && i + 1 < argc)
+		{
+			enableSemantic = true;
+			semanticMode   = SemanticWorker::Mode::Http;
+			semanticUrl    = argv[++i];
+		}
 		else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0)
 		{
 			printUsage();
@@ -343,7 +376,9 @@ int main(int argc, char * argv[])
 	if (outputDir.empty()) outputDir = "output";
 
 	if (source == SRC_REALSENSE)
-		return runLive(dbPath, outputDir, gridTcpPort);
+		return runLive(dbPath, outputDir, gridTcpPort,
+		               enableSemantic, semanticMode, semanticUrl);
 	else
-		return runUnity(dbPath, outputDir, gridTcpPort, sensorTcpPort);
+		return runUnity(dbPath, outputDir, gridTcpPort, sensorTcpPort,
+		                enableSemantic, semanticMode, semanticUrl);
 }

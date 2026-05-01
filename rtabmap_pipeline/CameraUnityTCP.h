@@ -69,10 +69,14 @@ typedef int socket_t_unity;
 
 namespace rtabmap {
 
-class CameraUnityTCP : public Camera
+// Renamed from CameraUnityTCP to avoid ODR conflict with rtabmap::CameraUnityTCP
+// (added to rtabmap core 2026-04-26). Both classes coexist in namespace rtabmap;
+// main.cpp uses this local one because rtabmap's lacks the drainIMU(maxStamp,
+// sink) lambda-pull pattern this pipeline relies on.
+class UnityTcpCameraLocal : public Camera
 {
 public:
-	CameraUnityTCP(int listenPort = 7778, float imageRate = 0.0f)
+	UnityTcpCameraLocal(int listenPort = 7778, float imageRate = 0.0f)
 		: Camera(imageRate),
 		  listenPort_(listenPort),
 		  listenSock_(INVALID_UNITY_SOCK),
@@ -82,7 +86,7 @@ public:
 		  width_(0), height_(0)
 	{}
 
-	virtual ~CameraUnityTCP()
+	virtual ~UnityTcpCameraLocal()
 	{
 		stop();
 	}
@@ -93,7 +97,7 @@ public:
 	{
 		if (!startServer()) return false;
 		running_ = true;
-		recvThread_ = std::thread(&CameraUnityTCP::recvLoop, this);
+		recvThread_ = std::thread(&UnityTcpCameraLocal::recvLoop, this);
 
 		// Wait for the first calibration packet (max 30s)
 		UINFO("CameraUnityTCP: waiting for Unity to connect on port %d...", listenPort_);

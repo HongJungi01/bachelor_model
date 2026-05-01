@@ -32,11 +32,15 @@
 #include "rtabmap/utilite/ULogger.h"
 #include "rtabmap/utilite/UTimer.h"
 
+#include "SemanticMaskStore.h"
+#include "SemanticWorker.h"
+
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <memory>
 #include <mutex>
 #include <atomic>
 #include <cmath>
@@ -86,7 +90,10 @@ public:
 	GridPublisher(
 		int tcpPort   = 7777,
 		double minPublishPeriod = 0.1,        // seconds (≈10 Hz cap)
-		const std::string & outputDir = "output")
+		const std::string & outputDir = "output",
+		SemanticWorker::Mode semanticMode = SemanticWorker::Mode::Mock,
+		const std::string & semanticUrl = "",
+		bool enableSemantic = false)
 		: grid_(&localGrids_),
 		  odometryCorrection_(Transform::getIdentity()),
 		  tcpPort_(tcpPort),
@@ -100,6 +107,16 @@ public:
 		initTcpServer();
 		UINFO("GridPublisher: TCP server on port %d, output dir '%s'",
 		      tcpPort_, outputDir_.c_str());
+
+		if (enableSemantic)
+		{
+			semanticWorker_ = std::make_unique<SemanticWorker>(
+				semanticMode,
+				semanticUrl,
+				[this](int nodeId, const cv::Mat & mask) {
+					semanticMasks_.setMask(nodeId, mask);
+				});
+		}
 	}
 
 	virtual ~GridPublisher()
@@ -189,13 +206,29 @@ private:
 			float cellSize = stats.getLastSignatureData().sensorData().gridCellSize();
 			if (cellSize > 0.0f)
 			{
-				cv::Mat ground, obstacles, empty;
+				cv::Mat rgb, depth, ground, obstacles, empty;
 				stats.getLastSignatureData().sensorData()
-					.uncompressDataConst(0, 0, 0, 0, &ground, &obstacles, &empty);
+					.uncompressDataConst(&rgb, &depth, 0, 0, &ground, &obstacles, &empty);
 				localGrids_.add(
 					lastId, ground, obstacles, empty,
 					cellSize,
 					stats.getLastSignatureData().sensorData().gridViewPoint());
+
+				// ── 1b. Semantic: register keyframe + submit RGB to worker ──
+				if (semanticWorker_)
+				{
+					const auto & sensorData = stats.getLastSignatureData().sensorData();
+					if (!sensorData.cameraModels().empty() && !rgb.empty())
+					{
+						const float zFloor = sensorData.gridViewPoint().z;
+						semanticMasks_.registerKeyframe(
+							lastId,
+							sensorData.cameraModels()[0],
+							depth,
+							zFloor);
+						semanticWorker_->submit({lastId, rgb.clone()});
+					}
+				}
 			}
 		}
 
@@ -212,6 +245,10 @@ private:
 		if (map8S.empty()) return;
 
 		float cellSize = grid_.getCellSize();
+
+		// ── 3b. Apply semantic masks (force cells to obstacle, post-grid-update) ──
+		if (semanticWorker_)
+			semanticMasks_.applyTo(map8S, stats.poses(), xMin, yMin, cellSize);
 
 		// ── Update odometry correction ──
 		odometryCorrection_ = stats.mapCorrection();
@@ -446,6 +483,10 @@ private:
 
 	UTimer          timer_;
 	int             frameCount_;
+
+	// Semantic (Phase-1: parking line tagging)
+	std::unique_ptr<SemanticWorker> semanticWorker_;
+	SemanticMaskStore               semanticMasks_;
 };
 
 #endif /* GRIDPUBLISHER_H_ */
