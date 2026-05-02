@@ -207,11 +207,18 @@ target_include_directories(rtabmap_gui SYSTEM PUBLIC
   "$<BUILD_INTERFACE:${PUBLIC_INCLUDE_DIRS};${INCLUDE_DIRS}>"
   "$<INSTALL_INTERFACE:${PUBLIC_INCLUDE_DIRS}>")
 
-TARGET_LINK_LIBRARIES(rtabmap_gui 
+# Semantic SLAM (parking line tagging via VLM sidecar) dependencies.
+# nlohmann_json is in vcpkg_export; cpp-httplib is vendored as single-header
+# at ${VCPKG}/include/httplib.h and reachable through the nlohmann_json
+# target's INTERFACE_INCLUDE_DIRECTORIES (same vcpkg include root).
+find_package(nlohmann_json CONFIG REQUIRED)
+
+TARGET_LINK_LIBRARIES(rtabmap_gui
   PUBLIC
     rtabmap_core ${PUBLIC_LIBRARIES}
   PRIVATE
     ${LIBRARIES}
+    nlohmann_json::nlohmann_json
 )
 
 SET_TARGET_PROPERTIES(

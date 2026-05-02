@@ -30,6 +30,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "rtabmap/gui/rtabmap_gui_export.h" // DLL export/import defines
 
+#include <memory>
+
 #include "rtabmap/utilite/UEventsHandler.h"
 #include <QMainWindow>
 #include <QtCore/QSet>
@@ -61,6 +63,12 @@ class GridTcpStreamer;
 class QGraphicsScene;
 class Ui_mainWindow;
 class QActionGroup;
+
+// Semantic SLAM (Phase-1: parking line tagging). Defined in
+// rtabmap/gui/semantic/{SemanticWorker,SemanticMaskStore}.h — forward-declared
+// here to keep cpp-httplib + nlohmann_json out of every TU that includes MainWindow.h
+class SemanticWorker;
+class SemanticMaskStore;
 
 namespace rtabmap {
 
@@ -444,6 +452,10 @@ private:
 	// TCP Grid Streaming
 	GridTcpStreamer * _gridTcpStreamer;
 	QAction * _actionTcpGridStreaming;
+
+	// Semantic SLAM (parking line → wall tagging via async VLM sidecar)
+	std::unique_ptr<::SemanticWorker>    _semanticWorker;
+	std::unique_ptr<::SemanticMaskStore> _semanticMasks;
 
 	// One-click source toggle (RealSense ↔ Unity Images)
 	QAction * _actionSourceRealSense;

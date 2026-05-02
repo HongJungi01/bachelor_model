@@ -25,6 +25,20 @@ ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+// Must come BEFORE any include that may pull in <windows.h>. cpp-httplib
+// (used via SemanticWorker.h below) requires winsock2.h, which conflicts
+// with the legacy winsock.h that <windows.h> drags in by default.
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef _WINSOCKAPI_
+#define _WINSOCKAPI_   // block windows.h from including winsock.h
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "rtabmap/gui/MainWindow.h"
 
 #include "ui_mainWindow.h"
@@ -105,6 +119,10 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "rtabmap/core/util3d_registration.h"
 #include "rtabmap/core/optimizer/OptimizerCVSBA.h"
 #include "rtabmap/gui/GridTcpStreamer.h"
+#include "rtabmap/gui/semantic/SemanticWorker.h"
+#include "rtabmap/gui/semantic/SemanticMaskStore.h"
+
+#include <cstdlib>  // std::getenv for RTABMAP_SEMANTIC_URL
 #include "rtabmap/core/Graph.h"
 #include "rtabmap/core/RegistrationIcp.h"
 #include <pcl/visualization/cloud_viewer.h>
@@ -750,6 +768,28 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	}
 
 	this->setFocus();
+
+	// Semantic SLAM auto-init: if RTABMAP_SEMANTIC_URL env var is set, spawn
+	// the worker that POSTs each new keyframe RGB to the VLM sidecar (e.g.
+	// GroundingDINO at http://127.0.0.1:7788/detect). Detected boxes become
+	// per-keyframe masks that get rastered onto the grid as obstacle (value 80)
+	// just before TCP publish, so loop-closure pose corrections flow through
+	// automatically.
+	if (const char * url = std::getenv("RTABMAP_SEMANTIC_URL"))
+	{
+		if (url[0])
+		{
+			_semanticMasks  = std::unique_ptr<::SemanticMaskStore>(new ::SemanticMaskStore());
+			::SemanticMaskStore * masksPtr = _semanticMasks.get();
+			_semanticWorker = std::unique_ptr<::SemanticWorker>(new ::SemanticWorker(
+				::SemanticWorker::Mode::Http,
+				std::string(url),
+				[masksPtr](int nodeId, const cv::Mat & mask) {
+					masksPtr->setMask(nodeId, mask);
+				}));
+			UINFO("MainWindow: semantic SLAM enabled via RTABMAP_SEMANTIC_URL=%s", url);
+		}
+	}
 
 	UDEBUG("");
 }
@@ -2060,13 +2100,16 @@ void MainWindow::processStats(const rtabmap::Statistics & stat)
 		{
 			// make sure data are uncompressed
 			// We don't need to uncompress images if we don't show them
-			bool uncompressImages = (!signature.sensorData().imageCompressed().empty() && 
+			bool uncompressImages = (!signature.sensorData().imageCompressed().empty() &&
 										((_ui->imageView_source->isVisible() && _ui->imageView_source->isImageShown()) ||
 										 _loopClosureViewer->isVisible()))
 									||
-									(!signature.sensorData().depthOrRightCompressed().empty() && 
+									(!signature.sensorData().depthOrRightCompressed().empty() &&
 									 ((_ui->imageView_loopClosure->isVisible() && _ui->imageView_loopClosure->isImageShown()) ||
-									  (_cloudViewer->isVisible() && _preferencesDialog->isCloudsShown(0))));
+									  (_cloudViewer->isVisible() && _preferencesDialog->isCloudsShown(0))))
+									||
+									// Semantic SLAM also needs RGB + depth
+									(_semanticWorker && !signature.sensorData().imageCompressed().empty());
 
 			bool uncompressScan = !signature.sensorData().laserScanCompressed().isEmpty() && (
 					_loopClosureViewer->isVisible() ||
@@ -2091,6 +2134,34 @@ void MainWindow::processStats(const rtabmap::Statistics & stat)
 				{
 					_cachedSignatures.insert(signature.id(), signature);
 					_cachedMemoryUsage += signature.sensorData().getMemoryUsed();
+
+					// Semantic SLAM: register keyframe + submit RGB to VLM worker.
+					// We snapshot the camera model + depth + floor height so the
+					// mask can be rastered later even if SensorData is evicted
+					// from working memory.
+					if(_semanticWorker && !signature.sensorData().cameraModels().empty() && !tmpRgb.empty())
+					{
+						const float zFloor = signature.sensorData().gridViewPoint().z;
+						// Pass the current best pose so setMask() can ray-cast
+						// immediately without waiting for applyTo().
+						rtabmap::Transform kfPose;
+						{
+							auto poseIt = stat.poses().find(signature.id());
+							if(poseIt != stat.poses().end())
+								kfPose = poseIt->second;
+						}
+						_semanticMasks->registerKeyframe(
+							signature.id(),
+							signature.sensorData().cameraModels()[0],
+							tmpDepth,
+							zFloor,
+							kfPose);
+						::SemanticWorker::Frame f;
+						f.nodeId = signature.id();
+						f.rgb    = tmpRgb.clone();
+						_semanticWorker->submit(std::move(f));
+					}
+
 					unsigned int count = 0;
 					if(!signature.getWords3().empty())
 					{
@@ -3596,6 +3667,14 @@ void MainWindow::updateMapCloud(
 		}
 		if(!map8S.empty())
 		{
+			// Semantic SLAM: project camera-frame point clouds onto the grid
+			// using each keyframe's current corrected pose (affine transform only,
+			// no ray-casting — that happened once at setMask() time).
+			if(_semanticWorker && _semanticMasks)
+			{
+				_semanticMasks->applyTo(map8S, poses, xMin, yMin, resolution);
+			}
+
 			//convert to gray scaled map
 			map8U = util3d::convertMap2Image8U(map8S);
 

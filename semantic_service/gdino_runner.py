@@ -51,18 +51,43 @@ class GDinoRunner:
 
         outputs = self.model(**inputs)
 
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            box_threshold=box_threshold,
-            text_threshold=text_threshold,
-            target_sizes=[(h, w)],
-        )[0]
+        # target_sizes and threshold kwargs vary across transformers versions;
+        # call with only the stable arguments and filter scores manually.
+        try:
+            raw = self.processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                target_sizes=[(h, w)],
+            )[0]
+        except TypeError:
+            # older API without target_sizes — rescale boxes ourselves
+            raw = self.processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+            )[0]
+            if len(raw["boxes"]):
+                scale = torch.tensor([w, h, w, h], dtype=torch.float32,
+                                     device=raw["boxes"].device)
+                raw["boxes"] = raw["boxes"] * scale
 
-        boxes = results["boxes"].cpu().tolist()
-        scores = results["scores"].cpu().tolist()
-        labels = results["labels"]
-        if hasattr(labels, "cpu"):
-            labels = labels.cpu().tolist()
+        scores_t = raw["scores"]
+        boxes_t  = raw["boxes"]
+        labels_raw = raw["labels"]
 
-        return {"boxes": boxes, "scores": scores, "labels": labels}
+        # Apply box_threshold; text_threshold applied via score (combined metric)
+        keep = scores_t >= box_threshold
+        boxes_t  = boxes_t[keep]
+        scores_t = scores_t[keep]
+
+        if isinstance(labels_raw, (list, tuple)):
+            labels_filtered = [l for l, k in zip(labels_raw, keep.tolist()) if k]
+        else:
+            labels_filtered = labels_raw[keep]
+            if hasattr(labels_filtered, "tolist"):
+                labels_filtered = labels_filtered.tolist()
+
+        return {
+            "boxes":  boxes_t.cpu().tolist(),
+            "scores": scores_t.cpu().tolist(),
+            "labels": labels_filtered,
+        }
