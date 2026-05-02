@@ -16,9 +16,8 @@
 5. [Unity TCP 모드로 SLAM 돌리기](#5-unity-tcp-모드로-slam-돌리기)
 6. [Semantic SLAM (Grounded-SAM 사이드카)](#6-semantic-slam-grounded-sam-사이드카)
 7. [Unity 측 설정 (`unityCar`)](#7-unity-측-설정-unitycar)
-8. [TCP 패킷 검증 도구](#8-tcp-패킷-검증-도구)
-9. [트러블슈팅](#9-트러블슈팅)
-10. [프로젝트 구조](#10-프로젝트-구조)
+8. [트러블슈팅](#8-트러블슈팅)
+9. [프로젝트 구조](#9-프로젝트-구조)
 
 ---
 
@@ -30,7 +29,7 @@
 | Windows SDK   | 10.0.22621.0 이상                    | VS Installer에 포함                              |
 | CMake         | 3.20+                                | VS2022 번들 사용 가능 (별도 설치 가능)           |
 | Unity         | 2022.3 LTS (DX11)                    | Unity TCP 모드만 사용                            |
-| Python 3.10+  | Semantic 사이드카 + 검증 도구용      | venv 자동 생성, GPU torch는 cu121 휠 권장        |
+| Python 3.10+  | Semantic 사이드카용                  | venv 자동 생성, GPU torch는 cu121 휠 권장        |
 | NVIDIA GPU    | Semantic SLAM 사용 시                 | 4GB+ (GroundingDINO-tiny + SAM-base 동시 로드)   |
 
 ---
@@ -220,10 +219,9 @@ INFO:     Uvicorn running on http://127.0.0.1:7788
 
 `run_rtabmap.bat`이 `RTABMAP_SEMANTIC_URL=http://127.0.0.1:7788/detect`를 환경변수로 세팅하므로 GUI는 사이드카가 켜져 있으면 자동 연결한다. 끄려면 `run_rtabmap.bat`의 해당 줄을 주석 처리하거나 빈 값으로 두면 됨.
 
-### 6-4. 디버그 도구
+### 6-4. 디버그 보기
 
-- `python C:\dev\semantic_viewer.py` — 사이드카의 `/debug_image`를 0.5초마다 폴링해서 박스+마스크 오버레이를 띄운다. SAM이 박스에 비해 얼마나 정확하게 라인을 잡아냈는지 시각적으로 확인 가능.
-- `python C:\dev\grid_client.py` — RTAB-Map GUI의 TCP 그리드 스트림을 실시간 렌더. 셀 값 **80(semantic)** 은 빨간색, **100(structural wall)** 은 검은색으로 구분돼 보임.
+사이드카의 `GET /debug_image`를 브라우저로 열면 (`http://127.0.0.1:7788/debug_image`) 마지막으로 처리한 keyframe에 박스 + SAM 마스크 오버레이가 그려진 JPEG가 뜬다. 매 추론마다 자동 갱신되니 새로 고침으로 확인.
 
 ### 6-5. 프롬프트 / 임계치 변경
 
@@ -243,13 +241,13 @@ GroundingDINO 프롬프트는 마침표(`. `)로 클래스를 구분한다.
 
 `c:\dev\unityCar` 디렉토리는 그대로 Unity 자산 패키지로 사용 가능 (`.meta` 포함).
 
-### 6-1. 폴더 통째로 import
+### 7-1. 폴더 통째로 import
 
 1. 기존 Unity 프로젝트의 `Assets/Car/`가 있으면 **삭제** (구버전 GUID 충돌 방지)
 2. `c:\dev\unityCar` 폴더를 `Assets/`로 통째로 복사 → `Assets/unityCar/`
 3. Unity 자동 import 대기
 
-### 6-2. 씬에 배치
+### 7-2. 씬에 배치
 
 `Assets/unityCar/Car 1.prefab`을 Hierarchy로 드래그.
 
@@ -259,7 +257,7 @@ GroundingDINO 프롬프트는 마침표(`. `)로 클래스를 구분한다.
 - **IMU Sensor** — gyro/accel (rad/s, m/s², body frame)
 - **RTAB Map Streamer** — TCP 클라이언트 (host=127.0.0.1, port=7778)
 
-### 6-3. 패킷 프로토콜 (참고)
+### 7-3. 패킷 프로토콜 (참고)
 
 ```
 Header (5B): [type:u8][payloadSize:u32]   ── little-endian
@@ -275,37 +273,7 @@ Header (5B): [type:u8][payloadSize:u32]   ── little-endian
 
 ---
 
-## 8. TCP 패킷 검증 도구
-
-Unity 측만 단독으로 시험하려면 (rtabmap 끄고) Python 서버를 사용한다.
-
-```powershell
-# 콘솔만
-python C:\dev\test_unity_tcp.py
-
-# RGB / Depth 시각화
-python C:\dev\test_unity_tcp.py --show
-```
-
-정상 출력 예시:
-
-```
-[server] listening on 0.0.0.0:7778
-[server] client connected from ('127.0.0.1', 5xxxx)
-[Calib #1]
-  size = 1280 x 720
-  fx=648.93 fy=648.93 cx=640.00 cy=360.00
-  localTransform: [[ 0  0  1  0][−1  0  0  0][ 0 −1  0  0]]
-[IMU #1] t=0.012s gyro=(...) accel=(0, 9.81, 0) |a|=9.81 m/s²
-[RGBD #1] t=0.123s 1280x720 payload=4608016B [OK]
---- stats: 5s Calib=1 IMU=234 (46 Hz) RGBD=68 (13.6 fps) ---
-```
-
-`Calib`이 한 번 오고 그 후 IMU/RGBD가 계속 흐르면 Unity 측은 정상.
-
----
-
-## 9. 트러블슈팅
+## 8. 트러블슈팅
 
 ### 빌드: `psapi.lib`를 못 찾음
 
@@ -353,16 +321,12 @@ python C:\dev\test_unity_tcp.py --show
 
 ---
 
-## 10. 프로젝트 구조
+## 9. 프로젝트 구조
 
 ```
 C:\dev\
 ├── SETUP_GUIDE.md               ← 이 문서
 ├── run_rtabmap.bat              ← RTABMap GUI 실행 (semantic URL 환경변수 포함)
-├── run_pipeline.bat             ← rtabmap_pipeline 실행 (Unity / RealSense × Mock / HTTP)
-├── test_unity_tcp.py            ← Unity TCP 검증용 Python 서버
-├── grid_client.py               ← GUI TCP 그리드 스트림 라이브 뷰어
-├── semantic_viewer.py           ← semantic_service /debug_image 라이브 뷰어
 │
 ├── rtabmap/                     ← RTAB-Map 0.23.4 fork
 │   ├── corelib/
@@ -382,14 +346,11 @@ C:\dev\
 │   │       └── CMakeLists.txt           (nlohmann_json 링크)
 │   └── build/                   ← (gitignore) cmake build
 │
-├── rtabmap_pipeline/            ← Standalone CLI (RealSense / Unity TCP × Mock / HTTP)
-│
 ├── semantic_service/            ★ Grounded-SAM 사이드카 (FastAPI)
 │   ├── run_semantic.bat         (venv + uvicorn 자동 부팅)
 │   ├── app.py                   (POST /detect, GET /debug_image)
 │   ├── gdino_runner.py          (GroundingDINO 텍스트→박스)
 │   ├── sam_runner.py            (SAM 박스→픽셀 마스크)
-│   ├── test_detect.py           (스모크 테스트)
 │   └── requirements.txt
 │
 ├── unityCar/                    ← Unity 자산 (Assets/에 복사)
