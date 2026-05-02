@@ -1,6 +1,8 @@
 # === Build outputs ===
 rtabmap/build/
+rtabmap/install/
 rtabmap_pipeline/build/
+/build/
 
 # === vcpkg pre-built dependencies (large, downloadable) ===
 vcpkg_export/
@@ -33,6 +35,7 @@ rtabmap/package.xml
 # === IDE / Editor ===
 .vs/
 .vscode/
+.claude/
 *.suo
 *.user
 *.sln.docstates
@@ -58,4 +61,11 @@ __pycache__/
 
 # === Environment ===
 .env
+
+# === Working notes / transient artifacts ===
+plan.md
+semanticplan.md
+grid.png
+semantic_service/.venv/
+semantic_service/__pycache__/
 
