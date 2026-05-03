@@ -14,7 +14,7 @@
 3. [RTAB-Map 빌드](#3-rtab-map-빌드)
 4. [실행](#4-실행)
 5. [Unity TCP 모드로 SLAM 돌리기](#5-unity-tcp-모드로-slam-돌리기)
-6. [Semantic SLAM (Grounded-SAM 사이드카)](#6-semantic-slam-grounded-sam-사이드카)
+6. [Semantic SLAM (Florence-2 + SAM + Gemini 사이드카)](#6-semantic-slam-florence-2--sam--gemini-사이드카)
 7. [Unity 측 설정 (`unityCar`)](#7-unity-측-설정-unitycar)
 8. [트러블슈팅](#8-트러블슈팅)
 9. [프로젝트 구조](#9-프로젝트-구조)
@@ -29,8 +29,9 @@
 | Windows SDK   | 10.0.22621.0 이상                    | VS Installer에 포함                              |
 | CMake         | 3.20+                                | VS2022 번들 사용 가능 (별도 설치 가능)           |
 | Unity         | 2022.3 LTS (DX11)                    | Unity TCP 모드만 사용                            |
-| Python 3.10+  | Semantic 사이드카용                  | venv 자동 생성, GPU torch는 cu121 휠 권장        |
-| NVIDIA GPU    | Semantic SLAM 사용 시                 | 4GB+ (GroundingDINO-tiny + SAM-base 동시 로드)   |
+| Python 3.11+  | Semantic 사이드카용                  | venv 자동 생성, GPU torch는 cu121 휠 권장        |
+| NVIDIA GPU    | Semantic SLAM 사용 시                 | 4GB+ (Florence-2 + SAM 동시 로드)               |
+| Gemini API 키 | L3 분류 사용 시                       | Google AI Studio에서 발급, `.env.bat`에 저장    |
 
 ---
 
@@ -80,9 +81,11 @@ cmd /c "`"$vs`" && cmake -S $repo -B $bld -G `"Visual Studio 17 2022`" -A x64 ^
 -- Build files have been written to: C:/dev/rtabmap/build
 ```
 
-### 3-2. 빌드
+### 3-2. 전체 빌드
 
 ```powershell
+$vs  = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+$bld = "C:\dev\rtabmap\build"
 cmd /c "`"$vs`" && cmake --build $bld --config Release --parallel"
 ```
 
@@ -96,9 +99,29 @@ C:\dev\rtabmap\build\bin\rtabmap_core.dll
 C:\dev\rtabmap\build\bin\rtabmap_gui.dll
 ```
 
-### 3-3. ⚠️ 빌드 실패 시 확인 — stub 헤더 정리
+### 3-3. GUI만 재빌드 (semantic 헤더 수정 후)
 
-이전 세션에서 누군가 임시로 만든 stub `*_export.h` / `Version.h`가 **source tree**에 남아 있으면 CMake가 자동 생성한 정확한 헤더를 가려서 다음 에러가 난다:
+`guilib/` 산하 파일만 수정했을 때 — `rtabmap_gui` 타깃만 빌드하면 `rtabmap_core`를 건드리지 않아 빠르다.
+
+```powershell
+$vs  = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+$bld = "C:\dev\rtabmap\build"
+cmd /c "`"$vs`" && cmake --build $bld --config Release --target rtabmap_gui --parallel"
+```
+
+주로 수정하는 파일:
+
+| 파일 | 재빌드 타깃 |
+|------|------------|
+| `guilib/include/rtabmap/gui/semantic/*.h` | `rtabmap_gui` |
+| `guilib/src/MainWindow.cpp` | `rtabmap_gui` |
+| `corelib/include/` 또는 `corelib/src/` | 전체 (`--parallel`) |
+
+> **팁**: `RTABMap.exe`가 실행 중이면 `rtabmap_gui.dll`을 덮어쓸 수 없어 `LNK1104` 에러가 난다. 빌드 전에 GUI를 닫는다.
+
+### 3-4. ⚠️ 빌드 실패 시 확인 — stub 헤더 정리
+
+이전 세션에서 임시로 만든 stub `*_export.h` / `Version.h`가 **source tree**에 남아 있으면 CMake가 자동 생성한 정확한 헤더를 가려서 다음 에러가 난다:
 
 ```
 error C2491: 'ULogger::instance_': dllimport 정적 데이터 멤버를 정의할 수 없습니다.
@@ -147,7 +170,7 @@ GUI 패널: **3D Map**, **Graph view (2D occupancy grid)**, **Loop closure detec
 
 Apply → OK.
 
-### 5-2. Unity 씬 준비 ([6절](#6-unity-측-설정-unitycar) 참고)
+### 5-2. Unity 씬 준비 ([7절](#7-unity-측-설정-unitycar) 참고)
 
 `unityCar` 패키지를 Unity 프로젝트 `Assets/`에 복사하고 `Car 1.prefab`을 씬에 배치.
 
@@ -174,30 +197,94 @@ Apply → OK.
 
 ---
 
-## 6. Semantic SLAM (Grounded-SAM 사이드카)
+## 6. Semantic SLAM (Florence-2 + SAM + Gemini 사이드카)
 
-주차선·차로 표시 같은 텍스트 라벨로 지정 가능한 객체를 픽셀 단위로 찾아내 2D occupancy grid에 obstacle(셀 값 **80**)로 태깅한다. 옵션 기능이며 사이드카 프로세스를 켜야 동작한다.
+주차장 내 의미 있는 구조물(기둥, 주차선, 출구 표지 등)을 감지해 2D occupancy grid에 레이어로 태깅한다. 3단계 파이프라인으로 구성되며, 사이드카 프로세스(`run_semantic.bat`)를 켜야 동작한다.
 
-### 6-1. 구성
+### 6-1. 파이프라인 구조
 
 ```
-[RTAB-Map GUI]  ─── HTTP POST ──▶  [semantic_service (FastAPI)]
-                                       ├─ GroundingDINO  (text-prompted detection)
-                                       └─ SAM            (pixel mask from boxes)
-       ◀──── JSON {boxes, mask_png_b64} ────
+[RTAB-Map GUI]
+   │
+   │  POST /detect  (keyframe JPEG)
+   ▼
+[semantic_service (FastAPI, port 7788)]
+   │
+   ├─ L1+L2: Florence-2 (CAPTION_TO_PHRASE_GROUNDING) → 바운딩 박스
+   │          SAM → 박스에서 픽셀 마스크 생성
+   │          ↳ 응답: boxes (좌표) + mask_png_b64
+   │
+   └─ L3:  POST /classify_batch  (JPEG + 박스 ID, 최대 5 프레임 묶음)
+           Gemini 3.1 Flash Lite → 박스별 label + confidence + visual_angle
+           ↳ 응답: classifications [{box_id, label, confidence, visual_angle}]
+
+[SemanticWorker (C++)]
+   ├─ /detect 응답: 박스를 PendingFrame 버퍼에 적재
+   └─ 5프레임 도달 or 1500ms 타임아웃 → /classify_batch 배치 전송
+      응답 도착 시 ResultCallback 호출 → SemanticMaskStore에 LabeledBox 등록
+
+[SemanticMaskStore]
+   ├─ LabeledBox → 레이블별 grid code 변환
+   │     pillar / parking_line / traffic_cone / no_entry_sign / construction_sign → 1
+   │     exit_area → 10
+   └─ applyTo(grid): pose × camPoints → 2D 셀에 코드 기록
 ```
 
-- GUI (`SemanticWorker`)가 keyframe RGB를 latest-only 큐로 사이드카에 보내고, 응답 마스크를 `SemanticMaskStore`에 캐시한다.
-- 픽셀 → 카메라 좌표계 3D 포인트 변환은 마스크 도착 시 **딱 한 번** 수행. 매 publish 호출은 `pose × camPoints` 행렬 곱만 — keyframe이 쌓여도 비용이 일정하다.
-- Loop closure로 pose가 정정되면 다음 publish에서 자동 반영.
+**핵심 설계**: L1+L2(Florence-2+SAM)는 영역만 분리하고 레이블을 붙이지 않는다. 레이블 할당은 L3(Gemini)만 한다. L3가 비동기로 도착하기 전까지는 이전 결과가 그대로 유지된다.
 
-### 6-2. 사이드카 실행
+### 6-2. Grid 셀 값
+
+| 값  | 의미 | 색상 (grid_client.py) |
+|-----|------|----------------------|
+| -1  | 미탐색 (unknown)       | 회색 (128,128,128) |
+|  0  | 빈 공간 (free)         | 흰색 (255,255,255) |
+|  1  | 벽면형 구조물          | 빨강 BGR (40,40,220) |
+| 10  | 목적지 (출구 구역)     | 초록 BGR (60,200,60) |
+| 100 | 동적 장애물 (RTAB-Map) | 검정 (0,0,0) |
+
+### 6-3. 사전 준비 — Gemini API 키 설정
+
+L3(Gemini 분류)를 사용하려면 API 키가 필요하다. 없으면 L1+L2 박스 감지만 동작한다.
+
+1. [Google AI Studio](https://aistudio.google.com/apikey)에서 키 발급
+2. `semantic_service/.env.bat.example`을 복사해서 `.env.bat` 생성:
+
+```powershell
+Copy-Item C:\dev\semantic_service\.env.bat.example C:\dev\semantic_service\.env.bat
+```
+
+3. `.env.bat` 열어서 키 입력:
+
+```bat
+@echo off
+set GEMINI_API_KEY=YOUR_KEY_HERE
+```
+
+`.env.bat`은 `.gitignore`에 등록되어 있어 커밋되지 않는다.
+
+### 6-4. 사이드카 실행
 
 ```powershell
 C:\dev\semantic_service\run_semantic.bat
 ```
 
-첫 실행 시 `semantic_service\.venv`를 만들고 `requirements.txt`(fastapi · uvicorn · torch · transformers · pillow · numpy)를 설치한다. 이후 실행은 venv를 활성화만 하고 uvicorn을 띄운다. HuggingFace 가중치는 첫 추론 시 자동 다운로드 — `IDEA-Research/grounding-dino-tiny` (~700MB), `facebook/sam-vit-base` (~360MB).
+첫 실행 시 `semantic_service\.venv`를 만들고 `requirements.txt`를 설치한다. HuggingFace 가중치는 첫 추론 시 자동 다운로드:
+- `microsoft/Florence-2-base` (~1.5GB)
+- `facebook/sam-vit-base` (~360MB)
+
+기동 완료 로그:
+
+```
+[semantic_service] L1+L2 loaded on device=cuda (florence=microsoft/Florence-2-base, sam=facebook/sam-vit-base)
+[semantic_service] L3 Gemini classifier loaded (model=gemini-3.1-flash-lite-preview)
+INFO:     Uvicorn running on http://127.0.0.1:7788
+```
+
+L3가 비활성(키 없음)이면:
+
+```
+[semantic_service] L3 disabled — set GEMINI_API_KEY (or GOOGLE_API_KEY) to enable /classify_batch
+```
 
 기본 venv는 **CPU torch**가 깔린다. GPU(권장)를 쓰려면 한 번만 수동 교체:
 
@@ -208,32 +295,43 @@ pip uninstall -y torch
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
-기동 로그에 `device=cuda`가 보이면 OK.
+### 6-5. GUI 연결
 
-```
-[semantic_service] models loaded on device=cuda (gdino=..., sam=facebook/sam-vit-base)
-INFO:     Uvicorn running on http://127.0.0.1:7788
-```
+`run_rtabmap.bat`이 `RTABMAP_SEMANTIC_URL=http://127.0.0.1:7788` 환경변수를 세팅하므로 GUI는 사이드카가 켜져 있으면 자동 연결한다. 끄려면 `run_rtabmap.bat`의 해당 줄을 주석 처리하거나 빈 값으로 두면 된다.
 
-### 6-3. GUI 연결
+### 6-6. 디버그 보기
 
-`run_rtabmap.bat`이 `RTABMAP_SEMANTIC_URL=http://127.0.0.1:7788/detect`를 환경변수로 세팅하므로 GUI는 사이드카가 켜져 있으면 자동 연결한다. 끄려면 `run_rtabmap.bat`의 해당 줄을 주석 처리하거나 빈 값으로 두면 됨.
+| 엔드포인트 | 설명 |
+|-----------|------|
+| `http://127.0.0.1:7788/debug_image` | 마지막 keyframe에 박스 + SAM 마스크 오버레이 (JPEG, 새로 고침으로 갱신) |
+| `http://127.0.0.1:7788/debug_json`  | 마지막 /detect 결과 요약 (JSON) |
+| `http://127.0.0.1:7788/healthz`     | 서비스 상태 + 모델 로드 여부 |
 
-### 6-4. 디버그 보기
+### 6-7. 프롬프트 / 임계치 변경
 
-사이드카의 `GET /debug_image`를 브라우저로 열면 (`http://127.0.0.1:7788/debug_image`) 마지막으로 처리한 keyframe에 박스 + SAM 마스크 오버레이가 그려진 JPEG가 뜬다. 매 추론마다 자동 갱신되니 새로 고침으로 확인.
-
-### 6-5. 프롬프트 / 임계치 변경
-
-`semantic_service/app.py`의 `DetectRequest` 기본값을 수정하거나, GUI 측 `SemanticWorker.h::httpDetect()`의 JSON body에서 `prompt`/`box_threshold`를 바꾸면 된다.
+`app.py`의 `DetectRequest` 기본값을 수정하면 Florence-2가 찾는 객체 유형을 바꿀 수 있다:
 
 ```python
-prompt = "parking space line . lane marking"
+prompt = (
+    "parking stall lines, exit signs, pillars, traffic cones, "
+    "no entry signs, construction signs, floor direction arrows"
+)
 box_threshold  = 0.3
 text_threshold = 0.25
 ```
 
-GroundingDINO 프롬프트는 마침표(`. `)로 클래스를 구분한다.
+Florence-2 CAPTION_TO_PHRASE_GROUNDING은 쉼표(`,`)로 구문을 구분한다.
+
+### 6-8. 점유 그리드 실시간 확인 (grid_client.py)
+
+RTAB-Map GUI가 TCP 7777 포트로 송출하는 occupancy grid를 별도 창으로 시각화한다:
+
+```powershell
+pip install opencv-python numpy
+python C:\dev\grid_client.py
+```
+
+`q` 또는 `ESC`로 종료. 셀 색상은 [6-2](#6-2-grid-셀-값) 참고.
 
 ---
 
@@ -281,7 +379,7 @@ Header (5B): [type:u8][payloadSize:u32]   ── little-endian
 
 ### 빌드: dllimport C2491 에러 / `RTABMAP_PCL_INDEX` 미정의
 
-→ source tree에 stub `*_export.h` / `Version.h`가 남아 generated 헤더를 가리는 경우. [3-3](#3-3-️-빌드-실패-시-확인--stub-헤더-정리) 참고.
+→ source tree에 stub `*_export.h` / `Version.h`가 남아 generated 헤더를 가리는 경우. [3-4](#3-4-️-빌드-실패-시-확인--stub-헤더-정리) 참고.
 
 ### 빌드: `LNK1104: rtabmap_gui.dll 파일을 열 수 없습니다`
 
@@ -299,25 +397,30 @@ Header (5B): [type:u8][payloadSize:u32]   ── little-endian
 
 → 이전 버그. `init()`이 메인 스레드에서 calibration을 무한 대기했음. 최신 버전은 non-blocking — rtabmap_core.dll을 다시 빌드해서 갱신.
 
-### Unity TCP: `RTAB-Map: Camera initialization failed`
-
-→ 30초 timeout 버전을 쓰고 있음. 위와 같은 fix 적용된 build로 교체.
-
 ### SLAM: 한 바퀴 돌면 맵이 휨
 
 → Loop closure가 거부되고 있음. [5-4](#5-4-휘는-맵-drift-보정--loop-closure-임계값-조정) 참고.
 
-### Semantic: GUI에 빨간 셀이 안 그려짐
+### Semantic: GUI에 빨간/초록 셀이 안 그려짐
 
 → ① `semantic_service`가 안 켜져 있음 — `run_semantic.bat` 콘솔에 `Uvicorn running on ...:7788`이 떠야 한다. ② `RTABMAP_SEMANTIC_URL`이 `run_rtabmap.bat`에서 비어 있음. ③ keyframe이 아직 없음 — Start 직후엔 정상.
 
-### Semantic: 사이드카 첫 요청에서 500 에러 / `cv2 not found`
+### Semantic: `/classify_batch` 502 에러
 
-→ 옛 버전의 `app.py`에 남아 있던 cv2 의존성. 최신본은 PIL 만으로 처리한다. `git pull` 후 재시작.
+→ Gemini API 키 문제. 원인:
+- `.env.bat`가 없음 → [6-3](#6-3-사전-준비--gemini-api-키-설정) 참고
+- 키가 만료/유출됨 → Google AI Studio에서 새 키 발급 후 `.env.bat` 수정
+- 키 발급 직후 활성화까지 수십 초 걸릴 수 있음
+
+`semantic_service` 콘솔에 `403 PERMISSION_DENIED` 또는 `reported as leaked`가 보이면 키를 새로 발급해야 한다.
 
 ### Semantic: GPU 안 잡힘 (`device=cpu` 로그)
 
-→ venv의 torch가 CPU 휠. [6-2](#6-2-사이드카-실행) 의 cu121 휠 수동 교체 절차 참고.
+→ venv의 torch가 CPU 휠. [6-4](#6-4-사이드카-실행) 의 cu121 휠 수동 교체 절차 참고.
+
+### Semantic: 모델 다운로드가 너무 느림
+
+→ HuggingFace 네트워크 속도 문제. `HUGGINGFACE_HUB_CACHE` 환경변수로 캐시 경로를 빠른 드라이브로 지정하거나, 다운로드 완료 후 재시작하면 캐시에서 로드된다.
 
 ---
 
@@ -327,6 +430,7 @@ Header (5B): [type:u8][payloadSize:u32]   ── little-endian
 C:\dev\
 ├── SETUP_GUIDE.md               ← 이 문서
 ├── run_rtabmap.bat              ← RTABMap GUI 실행 (semantic URL 환경변수 포함)
+├── grid_client.py               ← TCP 7777 occupancy grid 실시간 뷰어
 │
 ├── rtabmap/                     ← RTAB-Map 0.23.4 fork
 │   ├── corelib/
@@ -337,8 +441,9 @@ C:\dev\
 │   │   │   ├── PreferencesDialog.h     (kSrcUnityTCP enum)
 │   │   │   ├── MainWindow.h            (semantic worker/store 멤버)
 │   │   │   └── semantic/                ★ Semantic SLAM
-│   │   │       ├── SemanticWorker.h         (HTTP 비동기 워커)
-│   │   │       ├── SemanticMaskStore.h      (camPoints 캐시 + applyTo)
+│   │   │       ├── SemanticLabeledBox.h     (LabeledBox 구조체: label, confidence, visual_angle)
+│   │   │       ├── SemanticWorker.h         (HTTP 비동기 워커: /detect + /classify_batch 배치)
+│   │   │       ├── SemanticMaskStore.h      (camPoints 캐시 + applyTo, 코드 1/10)
 │   │   │       └── SemanticBackproject.h    (depth/ray-plane 헬퍼)
 │   │   └── src/
 │   │       ├── MainWindow.cpp           (semantic 통합 + grid raster)
@@ -346,11 +451,14 @@ C:\dev\
 │   │       └── CMakeLists.txt           (nlohmann_json 링크)
 │   └── build/                   ← (gitignore) cmake build
 │
-├── semantic_service/            ★ Grounded-SAM 사이드카 (FastAPI)
-│   ├── run_semantic.bat         (venv + uvicorn 자동 부팅)
-│   ├── app.py                   (POST /detect, GET /debug_image)
-│   ├── gdino_runner.py          (GroundingDINO 텍스트→박스)
-│   ├── sam_runner.py            (SAM 박스→픽셀 마스크)
+├── semantic_service/            ★ Florence-2 + SAM + Gemini 사이드카 (FastAPI)
+│   ├── run_semantic.bat         (venv + uvicorn 자동 부팅, .env.bat 로드)
+│   ├── .env.bat                 (gitignore) GEMINI_API_KEY 설정
+│   ├── .env.bat.example         키 설정 템플릿 (커밋됨)
+│   ├── app.py                   (POST /detect, POST /classify_batch, GET /debug_image)
+│   ├── florence_runner.py       (L2: Florence-2 CAPTION_TO_PHRASE_GROUNDING)
+│   ├── gemini_runner.py         (L3: Gemini 분류기, label+confidence+visual_angle)
+│   ├── sam_runner.py            (L2: SAM 박스→픽셀 마스크)
 │   └── requirements.txt
 │
 ├── unityCar/                    ← Unity 자산 (Assets/에 복사)
