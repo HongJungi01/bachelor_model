@@ -7,10 +7,11 @@ can see VLM detections (parking lines etc.) layered on top of the
 structural map.
 
 Cell value legend:
-    -1  unknown    -> gray  (128, 128, 128)
-     0  free       -> white (255, 255, 255)
-    80  semantic   -> red   ( 40,  40, 220)  BGR
-   100  obstacle   -> black (  0,   0,   0)
+    -1  unknown          -> gray  (128, 128, 128)
+     0  free             -> white (255, 255, 255)
+     1  wall-like semantic (pillar/parking_line/etc.) -> red   BGR ( 40,  40, 220)
+    10  destination (exit_area)                       -> green BGR ( 60, 200,  60)
+   100  obstacle         -> black (  0,   0,   0)
 
 Usage:
     pip install opencv-python numpy
@@ -71,7 +72,8 @@ def read_frame(sock: socket.socket) -> GridFrame:
 def grid_to_bgr(grid: np.ndarray) -> np.ndarray:
     bgr = np.full((*grid.shape, 3), 128, dtype=np.uint8)  # unknown = gray
     bgr[grid == 0]   = (255, 255, 255)   # free
-    bgr[grid == 80]  = ( 40,  40, 220)   # semantic  (red in BGR)
+    bgr[grid == 1]   = ( 40,  40, 220)   # wall-like semantic (red in BGR)
+    bgr[grid == 10]  = ( 60, 200,  60)   # destination / exit_area (green)
     bgr[grid == 100] = (  0,   0,   0)   # obstacle
     return bgr
 
@@ -122,7 +124,7 @@ def main() -> int:
             time.sleep(1.0)
 
     sock.settimeout(None)
-    print("[grid_client] connected  —  press q or ESC to quit")
+    print("[grid_client] connected  --  press q or ESC to quit")
 
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 
@@ -135,8 +137,8 @@ def main() -> int:
             f = read_frame(sock)
             frame_count += 1
 
-            img = grid_to_bgr(f.grid)
-            n_sem = int(np.count_nonzero(f.grid == 80))
+            img = grid_to_bgr(np.flipud(f.grid))
+            n_sem = int(np.count_nonzero((f.grid == 1) | (f.grid == 10)))
             n_obs = int(np.count_nonzero(f.grid == 100))
             draw_overlay(img, f, n_sem, n_obs, frame_count)
 

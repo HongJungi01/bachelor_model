@@ -770,10 +770,11 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	this->setFocus();
 
 	// Semantic SLAM auto-init: if RTABMAP_SEMANTIC_URL env var is set, spawn
-	// the worker that POSTs each new keyframe RGB to the VLM sidecar (e.g.
-	// GroundingDINO at http://127.0.0.1:7788/detect). Detected boxes become
-	// per-keyframe masks that get rastered onto the grid as obstacle (value 80)
-	// just before TCP publish, so loop-closure pose corrections flow through
+	// the worker that POSTs each keyframe RGB to the semantic sidecar
+	// (Florence-2 + SAM at /detect, Gemini at /classify_batch). Returned
+	// labeled boxes are rasterised into per-keyframe semantic masks and
+	// projected onto the grid (codes: 1=wall-like, 10=destination) just
+	// before TCP publish, so loop-closure pose corrections flow through
 	// automatically.
 	if (const char * url = std::getenv("RTABMAP_SEMANTIC_URL"))
 	{
@@ -784,8 +785,9 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 			_semanticWorker = std::unique_ptr<::SemanticWorker>(new ::SemanticWorker(
 				::SemanticWorker::Mode::Http,
 				std::string(url),
-				[masksPtr](int nodeId, const cv::Mat & mask) {
-					masksPtr->setMask(nodeId, mask);
+				[masksPtr](int nodeId,
+				           const std::vector<::semantic::LabeledBox> & boxes) {
+					masksPtr->setLabeledBoxes(nodeId, boxes);
 				}));
 			UINFO("MainWindow: semantic SLAM enabled via RTABMAP_SEMANTIC_URL=%s", url);
 		}
@@ -2142,8 +2144,8 @@ void MainWindow::processStats(const rtabmap::Statistics & stat)
 					if(_semanticWorker && !signature.sensorData().cameraModels().empty() && !tmpRgb.empty())
 					{
 						const float zFloor = signature.sensorData().gridViewPoint().z;
-						// Pass the current best pose so setMask() can ray-cast
-						// immediately without waiting for applyTo().
+						// Pass the current best pose so setLabeledBoxes() can
+						// ray-cast immediately without waiting for applyTo().
 						rtabmap::Transform kfPose;
 						{
 							auto poseIt = stat.poses().find(signature.id());
@@ -3668,8 +3670,8 @@ void MainWindow::updateMapCloud(
 		if(!map8S.empty())
 		{
 			// Semantic SLAM: project camera-frame point clouds onto the grid
-			// using each keyframe's current corrected pose (affine transform only,
-			// no ray-casting — that happened once at setMask() time).
+			// using each keyframe's current corrected pose (affine transform
+			// only, no ray-casting — that happened once at setLabeledBoxes() time).
 			if(_semanticWorker && _semanticMasks)
 			{
 				_semanticMasks->applyTo(map8S, poses, xMin, yMin, resolution);

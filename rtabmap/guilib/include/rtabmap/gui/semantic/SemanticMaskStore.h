@@ -5,53 +5,65 @@
  *
  * Key design principle: ray-cast (depth read / ray-plane intersection) is
  * pose-independent — it operates in camera space and depends only on the
- * depth image and intrinsics.  It is therefore done ONCE when the mask
- * arrives (setMask) and the resulting camera-frame 3-D points are stored.
+ * depth image and intrinsics.  It is therefore done ONCE when the labeled
+ * boxes arrive (setLabeledBoxes) and the resulting camera-frame 3-D points
+ * are stored, each tagged with the grid code derived from its Gemini label.
  *
  * applyTo() then only needs to apply the current corrected pose transform
  * (a cheap affine multiply) to project those points onto the map grid.
  * Loop-closure pose corrections flow through automatically because poses
  * are looked up fresh on every applyTo() call.
  *
- * Complexity:
- *   Old: applyTo = O(N * W*H/step^2) with full ray-cast per pixel per call
- *   New: setMask = O(W*H/step^2)  ray-cast once
- *        applyTo = O(N * M)  affine transform only  (M = nonzero pixel count)
+ * Grid codes (semantic overlay on int8 occupancy grid):
+ *   1   wall-like      pillar, traffic_cone, parking_line,
+ *                      no_entry_sign, construction_sign
+ *   10  destination    exit_area
+ *   0   skip           any other label (lane_divider, exit_sign,
+ *                      one_way_marker, intersection, floor_arrow*,
+ *                      other) — not written to grid
+ *
+ *   * floor_arrow direction encoding (101~104) is deferred — needs
+ *     lane-cell identification + pose-aware angle conversion.
  */
 
 #ifndef SEMANTICMASKSTORE_H_
 #define SEMANTICMASKSTORE_H_
 
 #include "SemanticBackproject.h"
+#include "SemanticLabeledBox.h"
 
 #include "rtabmap/core/Transform.h"
 #include "rtabmap/core/CameraModel.h"
 
 #include <opencv2/core.hpp>
+#include <algorithm>
 #include <unordered_map>
 #include <map>
 #include <mutex>
 #include <cmath>
+#include <string>
 #include <vector>
 
 class SemanticMaskStore
 {
 public:
     struct Entry {
-        // Camera-frame 3-D points computed once at setMask() time.
-        // These are pose-independent; only the transform in applyTo() varies.
+        // Camera-frame 3-D points + parallel grid codes, computed once at
+        // setLabeledBoxes() time. Pose-independent; only the transform in
+        // applyTo() varies.
         std::vector<cv::Point3f> camPoints;
-        rtabmap::Transform       localTransform; // cam ↔ robot-base (from CameraModel)
+        std::vector<int8_t>      camCodes;       // same length as camPoints
+        rtabmap::Transform       localTransform; // cam ↔ robot-base
         float                    zFloor = 0.0f;
 
-        // Held only until the mask arrives, then released to free memory.
+        // Held only until labels arrive, then released to free memory.
         rtabmap::CameraModel     pendingCM;
         cv::Mat                  pendingDepth;   // CV_16UC1 or CV_32FC1; may be empty
         rtabmap::Transform       pendingPose;    // best pose at registerKeyframe() time
     };
 
     // Called from the SLAM thread when a new keyframe is created.
-    // Snapshots all data needed to ray-cast the mask later.
+    // Snapshots all data needed to ray-cast labeled boxes later.
     void registerKeyframe(int nodeId,
                           const rtabmap::CameraModel & cm,
                           const cv::Mat & depth,
@@ -59,41 +71,87 @@ public:
                           const rtabmap::Transform & pose)
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        Entry & e       = entries_[nodeId];
+        Entry & e        = entries_[nodeId];
         e.localTransform = cm.localTransform();
         e.zFloor         = zFloor;
         e.pendingCM      = cm;
         e.pendingDepth   = depth.empty() ? cv::Mat() : depth.clone();
         e.pendingPose    = pose;
-        e.camPoints.clear(); // reset if re-registered
+        e.camPoints.clear();
+        e.camCodes.clear();
     }
 
-    // Called by SemanticWorker when a SAM mask arrives for nodeId.
-    // Performs the ray-cast immediately and stores camera-frame points.
-    // Releases depth image and camera model to free memory.
-    void setMask(int nodeId, const cv::Mat & mask)
+    // Called by SemanticWorker when /classify_batch labels arrive for nodeId.
+    // Rasterises the boxes into a label map, performs the ray-cast, and stores
+    // (camera-frame point, grid code) pairs. Releases pending depth + camera
+    // model. Boxes whose label maps to grid code 0 are silently skipped.
+    void setLabeledBoxes(int nodeId,
+                         const std::vector<semantic::LabeledBox> & boxes)
     {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = entries_.find(nodeId);
         if (it == entries_.end()) return;
         Entry & e = it->second;
 
-        if (e.pendingCM.fx() <= 0.0f || mask.empty()) return;
+        if (e.pendingCM.fx() <= 0.0f)
+        {
+            // Camera model never registered (or already consumed) — bail.
+            return;
+        }
 
-        const rtabmap::Transform T_cam2map =
-            e.pendingPose * e.localTransform;
+        const int W = static_cast<int>(e.pendingCM.imageWidth());
+        const int H = static_cast<int>(e.pendingCM.imageHeight());
+        if (W <= 0 || H <= 0)
+        {
+            e.pendingDepth = cv::Mat();
+            e.pendingCM    = rtabmap::CameraModel();
+            return;
+        }
 
-        e.camPoints = buildCamPoints(mask, e.pendingCM, e.pendingDepth,
-                                     e.zFloor, T_cam2map);
+        cv::Mat labeled = cv::Mat::zeros(H, W, CV_8UC1);
+        int rasterised = 0;
+        for (const auto & lb : boxes)
+        {
+            const int8_t code = labelToGridCode(lb.label);
+            if (code == 0) continue;
+            const int prio = priorityOf(code);
 
-        // Release bulky data — no longer needed.
+            const int x1 = std::max(0, std::min(W,     static_cast<int>(lb.x1)));
+            const int y1 = std::max(0, std::min(H,     static_cast<int>(lb.y1)));
+            const int x2 = std::max(0, std::min(W,     static_cast<int>(lb.x2)));
+            const int y2 = std::max(0, std::min(H,     static_cast<int>(lb.y2)));
+            if (x2 <= x1 || y2 <= y1) continue;
+
+            for (int v = y1; v < y2; ++v)
+            {
+                uchar * row = labeled.ptr<uchar>(v);
+                for (int u = x1; u < x2; ++u)
+                {
+                    if (priorityOf(static_cast<int8_t>(row[u])) < prio)
+                        row[u] = static_cast<uchar>(code);
+                }
+            }
+            ++rasterised;
+        }
+
+        if (rasterised > 0)
+        {
+            const rtabmap::Transform T_cam2map = e.pendingPose * e.localTransform;
+            buildCamPoints(labeled, e.pendingCM, e.pendingDepth,
+                           e.zFloor, T_cam2map,
+                           e.camPoints, e.camCodes);
+        }
+
+        // Release bulky data — mask store no longer needs it for this entry.
         e.pendingDepth = cv::Mat();
         e.pendingCM    = rtabmap::CameraModel();
     }
 
     // Projects all stored camera-frame point clouds onto map8S using each
-    // keyframe's CURRENT corrected pose.  Only affine transforms — no
-    // ray-casting — happen here.
+    // keyframe's CURRENT corrected pose. Only affine transforms — no
+    // ray-casting — happen here. Higher-priority codes (wall) cannot be
+    // overwritten by lower-priority codes (destination) within a single
+    // applyTo() call.
     void applyTo(cv::Mat & map8S,
                  const std::map<int, rtabmap::Transform> & poses,
                  float xMin, float yMin, float cellSize) const
@@ -110,12 +168,16 @@ public:
             const rtabmap::Transform T_cam2map =
                 poseIt->second * e.localTransform;
 
-            for (const cv::Point3f & Pcam : e.camPoints)
+            const size_t N = e.camPoints.size();
+            for (size_t i = 0; i < N; ++i)
             {
-                const cv::Point3f Pmap =
-                    semantic::transformCamToMap(Pcam, T_cam2map);
+                const int8_t code = e.camCodes[i];
+                if (code == 0) continue;
 
-                // Reject if loop-closure correction moved point off the floor.
+                const cv::Point3f Pmap =
+                    semantic::transformCamToMap(e.camPoints[i], T_cam2map);
+
+                // Reject if loop-closure correction moved the point off the floor.
                 if (std::fabs(Pmap.z - e.zFloor) > 0.20f) continue;
 
                 const int cx = static_cast<int>(
@@ -125,7 +187,9 @@ public:
                 if (cx < 0 || cx >= map8S.cols) continue;
                 if (cy < 0 || cy >= map8S.rows) continue;
 
-                map8S.at<int8_t>(cy, cx) = 80;
+                int8_t & cell = map8S.at<int8_t>(cy, cx);
+                if (priorityOf(cell) < priorityOf(code))
+                    cell = code;
             }
         }
     }
@@ -146,6 +210,32 @@ public:
     }
 
 private:
+    // Gemini label -> int8 grid code. Stays in sync with prompt.md /
+    // gemini_runner.py category catalog. Returning 0 means "do not write".
+    static int8_t labelToGridCode(const std::string & label)
+    {
+        if (label == "pillar"            ||
+            label == "traffic_cone"      ||
+            label == "parking_line"      ||
+            label == "no_entry_sign"     ||
+            label == "construction_sign")  return 1;
+        if (label == "exit_area")          return 10;
+        // Deferred until lane-cell identification + pose-aware direction
+        // conversion lands: floor_arrow, one_way_marker, lane_divider.
+        // Always skipped: exit_sign, intersection, other.
+        return 0;
+    }
+
+    // Priority for rasterisation overlap: higher overrides lower. Values
+    // outside the semantic set (e.g. RTABMap's -1 unknown, 0 free, 100
+    // occupied) read as priority 0 so wall codes still win over them.
+    static int priorityOf(int8_t code)
+    {
+        if (code == 1)  return 100;   // wall-like — never overwritten
+        if (code == 10) return 50;
+        return 0;
+    }
+
     static float readDepthMeters(const cv::Mat & depth, int u, int v)
     {
         if (depth.type() == CV_16UC1) return depth.at<uint16_t>(v, u) * 0.001f;
@@ -153,32 +243,36 @@ private:
         return 0.0f;
     }
 
-    // Ray-cast: called once per keyframe when the mask arrives.
-    // Returns camera-frame 3-D points for every nonzero mask pixel that
-    // successfully projects onto the floor plane.
-    static std::vector<cv::Point3f> buildCamPoints(
-        const cv::Mat & mask,
+    // Ray-cast: walks the labeled mask, projects every non-zero pixel onto
+    // the floor plane, and emits parallel camera-frame point + code arrays.
+    static void buildCamPoints(
+        const cv::Mat & labeledMask,
         const rtabmap::CameraModel & cm,
         const cv::Mat & depth,
         float zFloor,
-        const rtabmap::Transform & T_cam2map)
+        const rtabmap::Transform & T_cam2map,
+        std::vector<cv::Point3f> & outPts,
+        std::vector<int8_t>      & outCodes)
     {
         const float fx = static_cast<float>(cm.fx());
         const float fy = static_cast<float>(cm.fy());
         const float cx = static_cast<float>(cm.cx());
         const float cy = static_cast<float>(cm.cy());
 
-        std::vector<cv::Point3f> pts;
-        pts.reserve(512);
+        outPts.clear();
+        outCodes.clear();
+        outPts.reserve(512);
+        outCodes.reserve(512);
 
         const int step = 2;
 
-        for (int v = 0; v < mask.rows; v += step)
+        for (int v = 0; v < labeledMask.rows; v += step)
         {
-            const uchar * row = mask.ptr<uchar>(v);
-            for (int u = 0; u < mask.cols; u += step)
+            const uchar * row = labeledMask.ptr<uchar>(v);
+            for (int u = 0; u < labeledMask.cols; u += step)
             {
-                if (row[u] == 0) continue;
+                const int8_t code = static_cast<int8_t>(row[u]);
+                if (code == 0) continue;
 
                 cv::Point3f Pcam;
                 bool ok = false;
@@ -197,9 +291,7 @@ private:
                     }
                 }
 
-                // Path 2: ray-plane fallback using the pose at registration
-                // time.  Slight error if loop closure later corrects the pose,
-                // but floor points are robust to small drift.
+                // Path 2: ray-plane fallback using the pose at registration time.
                 if (!ok)
                 {
                     cv::Point3f Pmap;
@@ -208,8 +300,6 @@ private:
                         fx, fy, cx, cy, T_cam2map, zFloor, Pmap);
                     if (ok)
                     {
-                        // Convert back to camera frame so applyTo only needs
-                        // a forward transform.
                         const rtabmap::Transform T_map2cam = T_cam2map.inverse();
                         Pcam = semantic::transformCamToMap(Pmap, T_map2cam);
                     }
@@ -217,16 +307,15 @@ private:
 
                 if (!ok) continue;
 
-                // Validate: project with current pose and check floor proximity.
+                // Validate: project with current pose, check floor proximity.
                 const cv::Point3f Pmap_check =
                     semantic::transformCamToMap(Pcam, T_cam2map);
                 if (std::fabs(Pmap_check.z - zFloor) > 0.15f) continue;
 
-                pts.push_back(Pcam);
+                outPts.push_back(Pcam);
+                outCodes.push_back(code);
             }
         }
-
-        return pts;
     }
 
     mutable std::mutex                    mtx_;

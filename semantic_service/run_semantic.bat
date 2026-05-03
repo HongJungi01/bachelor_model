@@ -14,6 +14,11 @@ REM   Subsequent runs just activate and start uvicorn.
 REM ============================================================
 
 setlocal
+if exist %~dp0.env.bat (
+    call %~dp0.env.bat
+) else (
+    echo [semantic_service] WARNING: .env.bat not found - create it from .env.bat.example
+)
 cd /d %~dp0
 
 if not exist .venv\Scripts\activate.bat (

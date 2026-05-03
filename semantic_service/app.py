@@ -1,8 +1,10 @@
 """
-FastAPI sidecar for Grounded-SAM open-vocabulary segmentation.
+FastAPI sidecar for Florence-2 + SAM open-vocabulary segmentation.
 
-Pipeline: GroundingDINO produces text-prompted boxes; SAM converts those
-boxes into pixel-accurate masks; the union mask is returned as a PNG.
+Pipeline: Florence-2 grounds the caption phrases to boxes; SAM converts
+those boxes into pixel-accurate masks; the union mask is returned as a
+PNG. The GroundingDINO runner is kept in the repo (gdino_runner.py) for
+easy revert — swap the import below to switch back.
 
 Endpoints:
   GET  /healthz       liveness + device probe (200 even before model loaded)
@@ -31,14 +33,16 @@ from fastapi.responses import Response
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
-from gdino_runner import GDinoRunner
+from florence_runner import FlorenceRunner
+from gemini_runner import GeminiClassifier, maybe_create_classifier
 from sam_runner import SamRunner
 
 # Long edge after internal resize — keeps inference latency bounded.
 INFERENCE_MAX_EDGE = 800
 
-_runner: GDinoRunner | None = None
+_runner: FlorenceRunner | None = None
 _sam: SamRunner | None = None
+_classifier: GeminiClassifier | None = None  # L3 — optional
 _device: str = "unknown"
 
 # Last-result store — updated under _debug_lock after each /detect call.
@@ -57,15 +61,29 @@ _COLORS = [
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _runner, _sam, _device
-    _runner = GDinoRunner()
+    global _runner, _sam, _device, _classifier
+    _runner = FlorenceRunner()
     _sam = SamRunner(device=_runner.device)
     _device = _runner.device
     print(
-        f"[semantic_service] models loaded on device={_device} "
-        f"(gdino={_runner.model_id}, sam={_sam.model_id})",
+        f"[semantic_service] L1+L2 loaded on device={_device} "
+        f"(florence={_runner.model_id}, sam={_sam.model_id})",
         flush=True,
     )
+
+    _classifier = maybe_create_classifier()
+    if _classifier is None:
+        print(
+            "[semantic_service] L3 disabled — set GEMINI_API_KEY (or "
+            "GOOGLE_API_KEY) to enable /classify_batch",
+            flush=True,
+        )
+    else:
+        print(
+            f"[semantic_service] L3 Gemini classifier loaded "
+            f"(model={_classifier.model})",
+            flush=True,
+        )
     yield
 
 
@@ -74,7 +92,13 @@ app = FastAPI(title="semantic_service", lifespan=lifespan)
 
 class DetectRequest(BaseModel):
     image_jpeg_b64: str
-    prompt: str = "parking space line . lane marking"
+    # Florence-2 phrase-grounding caption: comma-separated noun phrases.
+    # "parking stall lines" (not "parking lines") helps the model exclude
+    # the dashed center lane divider — see prompt.md disambiguation rules.
+    prompt: str = (
+        "parking stall lines, exit signs, pillars, traffic cones, "
+        "no entry signs, construction signs, floor direction arrows"
+    )
     box_threshold: float = 0.3
     text_threshold: float = 0.25
     request_id: int | None = None
@@ -283,3 +307,70 @@ def debug_json() -> Any:
     if meta is None:
         raise HTTPException(status_code=404, detail="no frame processed yet")
     return meta
+
+
+# ---------------------------------------------------------------------------
+# L3 — Claude semantic classification
+# ---------------------------------------------------------------------------
+# Separate from /detect on purpose: L1+L2 (above) return in tens-to-hundreds
+# of ms; L3 calls a remote LLM and takes 1-3s per batch. Keeping them on
+# different endpoints lets the SLAM client run L1+L2 every frame and only
+# trigger L3 every Nth frame.
+
+class L3Box(BaseModel):
+    id: int = Field(..., description="caller-assigned box id, returned 1:1 in classifications")
+    box: list[float] = Field(..., description="[x1,y1,x2,y2] in image pixels")
+
+
+class L3Frame(BaseModel):
+    request_id: int
+    image_jpeg_b64: str
+    boxes: list[L3Box]
+
+
+class ClassifyBatchRequest(BaseModel):
+    frames: list[L3Frame] = Field(..., description="up to 5 frames per call")
+
+
+@app.post("/classify_batch")
+def classify_batch(req: ClassifyBatchRequest) -> dict[str, Any]:
+    if _classifier is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "L3 disabled: set GEMINI_API_KEY (or GOOGLE_API_KEY) and "
+                "restart the service"
+            ),
+        )
+    if not req.frames:
+        raise HTTPException(status_code=400, detail="frames must be non-empty")
+    if len(req.frames) > 5:
+        raise HTTPException(status_code=400, detail="at most 5 frames per call")
+
+    frames: list[dict[str, Any]] = []
+    for f in req.frames:
+        try:
+            raw = base64.b64decode(f.image_jpeg_b64, validate=False)
+            pil = Image.open(io.BytesIO(raw)).convert("RGB")
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"frame request_id={f.request_id} bad jpeg: {e}",
+            ) from e
+        frames.append({
+            "request_id": f.request_id,
+            "image": pil,
+            "boxes": [{"id": b.id, "box": b.box} for b in f.boxes],
+        })
+
+    t0 = time.perf_counter()
+    try:
+        out = _classifier.classify_batch(frames)
+    except Exception as e:
+        import traceback
+        print(f"[semantic_service] /classify_batch FAILED: "
+              f"{type(e).__name__}: {e}", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"gemini api error: {e}") from e
+    out["inference_ms"] = int((time.perf_counter() - t0) * 1000.0)
+    return out
