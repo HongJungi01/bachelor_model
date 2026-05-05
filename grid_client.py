@@ -2,16 +2,23 @@
 grid_client.py - Live visualizer for the RTABMap GUI's TCP grid stream.
 
 Connects to 127.0.0.1:7777 and renders the occupancy grid + robot pose
-in real time. Semantic-tagged cells (value 80) are drawn in red so you
-can see VLM detections (parking lines etc.) layered on top of the
-structural map.
+in real time. Semantic-tagged cells are drawn in distinct colors so you
+can see LLM detections (parking lines, exit areas, direction signs)
+layered on top of the structural map.
 
-Cell value legend:
-    -1  unknown          -> gray  (128, 128, 128)
-     0  free             -> white (255, 255, 255)
-     1  wall-like semantic (pillar/parking_line/etc.) -> red   BGR ( 40,  40, 220)
-    10  destination (exit_area)                       -> green BGR ( 60, 200,  60)
-   100  obstacle         -> black (  0,   0,   0)
+Cell value legend (matches SemanticMaskStore.h / prompt.md):
+    -1     unknown          -> gray   (128, 128, 128)
+     0     free             -> white  (255, 255, 255)
+     1     wall-like        -> red    BGR ( 40,  40, 220)
+                               pillar / parking_line / traffic_cone /
+                               no_entry_sign / construction_sign
+    10     destination      -> green  BGR ( 60, 200,  60)
+                               exit_area
+    11..18 dest direction   -> cyan   BGR (220, 200,  60)
+                               exit_sign / floor_arrow (10 + worldDirBin)
+    21..28 one-way zone     -> magenta BGR (200,  60, 200)
+                               one_way_marker (20 + worldDirBin)
+   100     obstacle (RTABMap structural) -> black (  0,   0,   0)
 
 Usage:
     pip install opencv-python numpy
@@ -74,6 +81,13 @@ def grid_to_bgr(grid: np.ndarray) -> np.ndarray:
     bgr[grid == 0]   = (255, 255, 255)   # free
     bgr[grid == 1]   = ( 40,  40, 220)   # wall-like semantic (red in BGR)
     bgr[grid == 10]  = ( 60, 200,  60)   # destination / exit_area (green)
+    # Direction-coded cells: bins 1..8 collapse to one color per family.
+    # The bin (low nibble) is preserved in the int8 grid for downstream
+    # path planners — only the visualization is flattened.
+    dest_dir = (grid >= 11) & (grid <= 18)
+    one_way  = (grid >= 21) & (grid <= 28)
+    bgr[dest_dir]    = (220, 200,  60)   # cyan-teal (BGR)
+    bgr[one_way]     = (200,  60, 200)   # magenta (BGR)
     bgr[grid == 100] = (  0,   0,   0)   # obstacle
     return bgr
 
@@ -138,7 +152,11 @@ def main() -> int:
             frame_count += 1
 
             img = grid_to_bgr(np.flipud(f.grid))
-            n_sem = int(np.count_nonzero((f.grid == 1) | (f.grid == 10)))
+            n_sem = int(np.count_nonzero(
+                (f.grid == 1) | (f.grid == 10)
+                | ((f.grid >= 11) & (f.grid <= 18))
+                | ((f.grid >= 21) & (f.grid <= 28))
+            ))
             n_obs = int(np.count_nonzero(f.grid == 100))
             draw_overlay(img, f, n_sem, n_obs, frame_count)
 

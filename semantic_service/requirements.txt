@@ -3,14 +3,6 @@ uvicorn[standard]
 pillow
 numpy
 torch
-# Florence-2 remote code calls self.forced_bos_token_id during config init,
-# which transformers >=4.50 no longer initializes early. Pin until upstream
-# remote code is updated.
-transformers>=4.41,<4.50
-einops
-timm
-# L3 — Gemini API (semantic classification).
-# claude_runner.py is kept on disk for rollback; uncomment `anthropic` if you
-# switch back.
+transformers
 google-genai
-# anthropic
+anthropic

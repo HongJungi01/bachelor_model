@@ -14,16 +14,21 @@
  * Loop-closure pose corrections flow through automatically because poses
  * are looked up fresh on every applyTo() call.
  *
- * Grid codes (semantic overlay on int8 occupancy grid):
- *   1   wall-like      pillar, traffic_cone, parking_line,
- *                      no_entry_sign, construction_sign
- *   10  destination    exit_area
- *   0   skip           any other label (lane_divider, exit_sign,
- *                      one_way_marker, intersection, floor_arrow*,
- *                      other) — not written to grid
+ * Grid codes (semantic overlay on int8 occupancy grid; matches prompt.md):
+ *   1      wall-like        pillar, traffic_cone, parking_line,
+ *                           no_entry_sign, construction_sign
+ *   10     destination      exit_area
+ *   11..18 dest direction   exit_sign, floor_arrow (10 + worldDirBin)
+ *   21..28 one-way zone     one_way_marker (20 + worldDirBin)
+ *   0      skip              lane_divider, intersection, anything else
  *
- *   * floor_arrow direction encoding (101~104) is deferred — needs
- *     lane-cell identification + pose-aware angle conversion.
+ * Direction bins (from semantic::imageAngleToWorldDirBin):
+ *   bin 1 = +Y world (north),  bin 3 = +X (east),
+ *   bin 5 = -Y (south),        bin 7 = -X (west); CW from north.
+ *
+ * Direction codes are baked at setLabeledBoxes() time using the keyframe's
+ * registration pose. Subsequent loop-closure rotations do NOT re-quantize
+ * already-stored bins — acceptable while quantization is 45° coarse.
  */
 
 #ifndef SEMANTICMASKSTORE_H_
@@ -108,11 +113,15 @@ public:
             return;
         }
 
+        // World-frame yaw at registration; used to quantize directional
+        // labels' image-plane visualAngle into world-frame direction bins.
+        const float robotYaw = e.pendingPose.theta();
+
         cv::Mat labeled = cv::Mat::zeros(H, W, CV_8UC1);
         int rasterised = 0;
         for (const auto & lb : boxes)
         {
-            const int8_t code = labelToGridCode(lb.label);
+            const int8_t code = resolveGridCode(lb, robotYaw);
             if (code == 0) continue;
             const int prio = priorityOf(code);
 
@@ -210,19 +219,35 @@ public:
     }
 
 private:
-    // Gemini label -> int8 grid code. Stays in sync with prompt.md /
-    // gemini_runner.py category catalog. Returning 0 means "do not write".
-    static int8_t labelToGridCode(const std::string & label)
+    // LLM label + robot yaw -> int8 grid code (prompt.md catalog).
+    // Returning 0 means "do not write". Directional labels require a
+    // valid lb.visualAngle; otherwise they are skipped.
+    static int8_t resolveGridCode(const semantic::LabeledBox & lb,
+                                  float robotYawRad)
     {
-        if (label == "pillar"            ||
-            label == "traffic_cone"      ||
-            label == "parking_line"      ||
-            label == "no_entry_sign"     ||
-            label == "construction_sign")  return 1;
-        if (label == "exit_area")          return 10;
-        // Deferred until lane-cell identification + pose-aware direction
-        // conversion lands: floor_arrow, one_way_marker, lane_divider.
-        // Always skipped: exit_sign, intersection, other.
+        const std::string & l = lb.label;
+        if (l == "pillar"            ||
+            l == "traffic_cone"      ||
+            l == "parking_line"      ||
+            l == "no_entry_sign"     ||
+            l == "construction_sign")  return 1;
+        if (l == "exit_area")          return 10;
+
+        if (lb.visualAngle < 0.0f) return 0;  // direction labels need angle
+
+        if (l == "exit_sign" || l == "floor_arrow")
+        {
+            const int bin = semantic::imageAngleToWorldDirBin(
+                lb.visualAngle, robotYawRad);
+            return static_cast<int8_t>(10 + bin);   // 11..18
+        }
+        if (l == "one_way_marker")
+        {
+            const int bin = semantic::imageAngleToWorldDirBin(
+                lb.visualAngle, robotYawRad);
+            return static_cast<int8_t>(20 + bin);   // 21..28
+        }
+        // lane_divider, intersection, unknown -> skip.
         return 0;
     }
 
@@ -231,8 +256,10 @@ private:
     // occupied) read as priority 0 so wall codes still win over them.
     static int priorityOf(int8_t code)
     {
-        if (code == 1)  return 100;   // wall-like — never overwritten
-        if (code == 10) return 50;
+        if (code == 1)                         return 100;  // wall-like
+        if (code >= 21 && code <= 28)          return  60;  // one-way rule
+        if (code >= 11 && code <= 18)          return  55;  // dest direction
+        if (code == 10)                        return  50;  // exit area
         return 0;
     }
 

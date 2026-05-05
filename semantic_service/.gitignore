@@ -1,8 +1,4 @@
 .venv/
+.env.bat
 __pycache__/
 *.pyc
-*.pt
-*.bin
-*.safetensors
-.cache/
-.env.bat

@@ -771,10 +771,11 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 
 	// Semantic SLAM auto-init: if RTABMAP_SEMANTIC_URL env var is set, spawn
 	// the worker that POSTs each keyframe RGB to the semantic sidecar
-	// (Florence-2 + SAM at /detect, Gemini at /classify_batch). Returned
-	// labeled boxes are rasterised into per-keyframe semantic masks and
-	// projected onto the grid (codes: 1=wall-like, 10=destination) just
-	// before TCP publish, so loop-closure pose corrections flow through
+	// (single LLM call at /detect — Gemini 3 Flash by default, Claude Sonnet
+	// 4.6 alternative). Returned labeled boxes are rasterised into per-
+	// keyframe semantic masks and projected onto the grid just before TCP
+	// publish (codes: 1=wall-like, 10=exit_area, 11..18=dest direction,
+	// 21..28=one-way zone), so loop-closure pose corrections flow through
 	// automatically.
 	if (const char * url = std::getenv("RTABMAP_SEMANTIC_URL"))
 	{

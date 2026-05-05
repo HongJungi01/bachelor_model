@@ -1,27 +1,32 @@
 """
-FastAPI sidecar for Florence-2 + SAM open-vocabulary segmentation.
+FastAPI sidecar for single-call LLM-based parking-lot scene analysis.
 
-Pipeline: Florence-2 grounds the caption phrases to boxes; SAM converts
-those boxes into pixel-accurate masks; the union mask is returned as a
-PNG. The GroundingDINO runner is kept in the repo (gdino_runner.py) for
-easy revert — swap the import below to switch back.
+Pipeline per /detect call:
+  1. Decode the keyframe JPEG.
+  2. Hand it to the LLM runner (Gemini 3 Flash by default; Claude Sonnet 4.6
+     when LLM_PROVIDER=anthropic). The LLM returns boxes + labels +
+     confidences, plus an image-plane visual_angle for direction-bearing
+     labels.
+  3. Run SAM on those boxes to refine into a pixel-accurate union mask.
+  4. Return detections (with label/visual_angle) and the mask PNG.
 
 Endpoints:
-  GET  /healthz       liveness + device probe (200 even before model loaded)
-  POST /detect        image (jpeg b64) + prompt -> boxes + union mask (PNG b64)
-  GET  /debug_image   last processed frame with mask overlay + boxes (JPEG)
+  GET  /healthz       liveness + provider name
+  POST /detect        image (jpeg b64) -> detections + union mask (PNG b64)
+  GET  /debug_image   last processed frame with mask overlay + labeled boxes
   GET  /debug_json    last detection result as JSON (no image payload)
 
-Boxes and the mask are both in the *decoded image's* coordinate space — i.e.
-the resolution after JPEG decode but BEFORE any downscale done internally
-for inference. The C++ caller can therefore raster directly to the image
-resolution it sent.
+Boxes returned to the caller are in the *decoded image's* coordinate space
+(i.e. the resolution after JPEG decode). The C++ caller can therefore
+raster directly to the image resolution it sent.
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import math
+import os
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -33,22 +38,21 @@ from fastapi.responses import Response
 from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field
 
-from florence_runner import FlorenceRunner
-from gemini_runner import GeminiClassifier, maybe_create_classifier
+from llm_runner import DIRECTIONAL_LABELS, LlmRunner, maybe_create_runner
 from sam_runner import SamRunner
 
-# Long edge after internal resize — keeps inference latency bounded.
-INFERENCE_MAX_EDGE = 800
+# Long edge after internal resize for SAM — keeps mask inference latency
+# bounded. The LLM still sees the original-resolution JPEG since Gemini
+# and Claude internally rescale their inputs anyway.
+SAM_MAX_EDGE = 800
 
-_runner: FlorenceRunner | None = None
+_runner: LlmRunner | None = None
 _sam: SamRunner | None = None
-_classifier: GeminiClassifier | None = None  # L3 — optional
 _device: str = "unknown"
 
-# Last-result store — updated under _debug_lock after each /detect call.
 _debug_lock = threading.Lock()
-_debug_jpeg: bytes | None = None          # annotated frame as JPEG bytes
-_debug_meta: dict[str, Any] | None = None # last detection summary
+_debug_jpeg: bytes | None = None
+_debug_meta: dict[str, Any] | None = None
 
 _COLORS = [
     (255,  80,  80),
@@ -56,34 +60,33 @@ _COLORS = [
     ( 80, 120, 255),
     (255, 200,  50),
     (200,  80, 255),
+    ( 80, 220, 220),
+    (255, 140,  60),
 ]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _runner, _sam, _device, _classifier
-    _runner = FlorenceRunner()
-    _sam = SamRunner(device=_runner.device)
-    _device = _runner.device
+    global _runner, _sam, _device
+
+    _sam = SamRunner()
+    _device = _sam.device
     print(
-        f"[semantic_service] L1+L2 loaded on device={_device} "
-        f"(florence={_runner.model_id}, sam={_sam.model_id})",
+        f"[semantic_service] SAM loaded on device={_device} (model={_sam.model_id})",
         flush=True,
     )
 
-    _classifier = maybe_create_classifier()
-    if _classifier is None:
+    _runner = maybe_create_runner()
+    if _runner is None:
+        provider = (os.environ.get("LLM_PROVIDER") or "gemini").lower()
+        env = "ANTHROPIC_API_KEY" if provider == "anthropic" else "GEMINI_API_KEY"
         print(
-            "[semantic_service] L3 disabled — set GEMINI_API_KEY (or "
-            "GOOGLE_API_KEY) to enable /classify_batch",
+            f"[semantic_service] LLM disabled — set {env} (LLM_PROVIDER={provider}) "
+            f"to enable /detect",
             flush=True,
         )
     else:
-        print(
-            f"[semantic_service] L3 Gemini classifier loaded "
-            f"(model={_classifier.model})",
-            flush=True,
-        )
+        print(f"[semantic_service] LLM ready: {_runner.name}", flush=True)
     yield
 
 
@@ -92,22 +95,20 @@ app = FastAPI(title="semantic_service", lifespan=lifespan)
 
 class DetectRequest(BaseModel):
     image_jpeg_b64: str
-    # Florence-2 phrase-grounding caption: comma-separated noun phrases.
-    # "parking stall lines" (not "parking lines") helps the model exclude
-    # the dashed center lane divider — see prompt.md disambiguation rules.
-    prompt: str = (
-        "parking stall lines, exit signs, pillars, traffic cones, "
-        "no entry signs, construction signs, floor direction arrows"
-    )
-    box_threshold: float = 0.3
-    text_threshold: float = 0.25
     request_id: int | None = None
 
 
 class Detection(BaseModel):
-    box: list[float] = Field(..., description="[x1,y1,x2,y2] in original image coords")
-    score: float
+    box: list[float] = Field(..., description="[x1, y1, x2, y2] in original image pixels")
     label: str
+    confidence: float
+    visual_angle: float | None = Field(
+        None,
+        description=(
+            "Image-plane angle [0, 360), clockwise from image-up. "
+            "Only set for floor_arrow / one_way_marker / exit_sign."
+        ),
+    )
 
 
 class DetectResponse(BaseModel):
@@ -125,6 +126,7 @@ def healthz() -> dict[str, Any]:
         "status": "ok",
         "model_loaded": _runner is not None and _sam is not None,
         "device": _device,
+        "provider": _runner.name if _runner is not None else None,
     }
 
 
@@ -145,53 +147,67 @@ def detect(req: DetectRequest) -> DetectResponse:
 
     orig_w, orig_h = pil.size
 
-    long_edge = max(orig_w, orig_h)
-    if long_edge > INFERENCE_MAX_EDGE:
-        scale = INFERENCE_MAX_EDGE / float(long_edge)
-        new_w = int(round(orig_w * scale))
-        new_h = int(round(orig_h * scale))
-        infer_pil = pil.resize((new_w, new_h), Image.BILINEAR)
-        sx = orig_w / float(new_w)
-        sy = orig_h / float(new_h)
-    else:
-        infer_pil = pil
-        sx = sy = 1.0
-
     t0 = time.perf_counter()
-    out = _runner.detect(
-        infer_pil,
-        prompt=req.prompt,
-        box_threshold=req.box_threshold,
-        text_threshold=req.text_threshold,
-    )
+
+    try:
+        llm_result = _runner.detect(pil)
+    except Exception as e:
+        import traceback
+        print(
+            f"[semantic_service] /detect LLM call FAILED: {type(e).__name__}: {e}",
+            flush=True,
+        )
+        traceback.print_exc()
+        raise HTTPException(status_code=502, detail=f"llm error: {e}") from e
 
     detections: list[Detection] = []
-    for box, score, label in zip(out["boxes"], out["scores"], out["labels"]):
-        x1, y1, x2, y2 = box
-        x1 *= sx
-        x2 *= sx
-        y1 *= sy
-        y2 *= sy
+    for d in llm_result.detections:
+        if len(d.box) != 4:
+            continue
+        x1, y1, x2, y2 = (float(v) for v in d.box)
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
         x1 = max(0.0, min(float(orig_w), x1))
         x2 = max(0.0, min(float(orig_w), x2))
         y1 = max(0.0, min(float(orig_h), y1))
         y2 = max(0.0, min(float(orig_h), y2))
-        if x2 <= x1 or y2 <= y1:
+        if x2 - x1 < 1.0 or y2 - y1 < 1.0:
             continue
+        va = d.visual_angle
+        if d.label not in DIRECTIONAL_LABELS:
+            va = None
+        elif va is not None:
+            va = float(va) % 360.0
         detections.append(
             Detection(
                 box=[x1, y1, x2, y2],
-                score=float(score),
-                label=str(label),
+                label=d.label,
+                confidence=float(d.confidence),
+                visual_angle=va,
             )
         )
 
-    # SAM: run on the already-downscaled infer_pil (GDINO's resolution) so SAM
-    # doesn't need to re-encode a full-res image. Boxes are scaled down to
-    # infer_pil coords; the returned mask is scaled back to original size.
-    sam_boxes = [[x / sx, y / sy, x2 / sx, y2 / sy]
-                 for x, y, x2, y2 in (d.box for d in detections)]
-    mask_small = _sam.segment(infer_pil, sam_boxes)
+    # SAM refinement on a downscaled copy to bound latency. Boxes scale
+    # the same way; the mask is upsampled back to the original resolution.
+    long_edge = max(orig_w, orig_h)
+    if long_edge > SAM_MAX_EDGE:
+        scale = SAM_MAX_EDGE / float(long_edge)
+        sam_w = int(round(orig_w * scale))
+        sam_h = int(round(orig_h * scale))
+        sam_pil = pil.resize((sam_w, sam_h), Image.BILINEAR)
+        sx = orig_w / float(sam_w)
+        sy = orig_h / float(sam_h)
+    else:
+        sam_pil = pil
+        sx = sy = 1.0
+
+    sam_boxes = [
+        [d.box[0] / sx, d.box[1] / sy, d.box[2] / sx, d.box[3] / sy]
+        for d in detections
+    ]
+    mask_small = _sam.segment(sam_pil, sam_boxes)
     if mask_small.shape != (orig_h, orig_w):
         mask_np = np.array(
             Image.fromarray(mask_small).resize((orig_w, orig_h), Image.NEAREST)
@@ -236,8 +252,6 @@ def _update_debug(
     try:
         img = orig_pil.copy()
 
-        # Tint mask pixels green so users can see SAM's true segmentation
-        # against the GDINO box outlines.
         if mask_np is not None and mask_np.any():
             base = np.array(img, dtype=np.uint8)
             sel = mask_np > 0
@@ -257,9 +271,27 @@ def _update_debug(
             color = _COLORS[i % len(_COLORS)]
             x1, y1, x2, y2 = (int(v) for v in det.box)
             draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-            label_text = f"{det.label} {det.score:.2f}"
+            label_text = f"{det.label} {det.confidence:.2f}"
+            if det.visual_angle is not None:
+                label_text += f" @{det.visual_angle:.0f}°"
             draw.rectangle([x1, y1 - 16, x1 + len(label_text) * 7, y1], fill=color)
             draw.text((x1 + 2, y1 - 15), label_text, fill=(255, 255, 255), font=font)
+
+            # Draw an angle arrow inside the box for directional labels.
+            # 0° = up; 90° = right; clockwise. In image XY:
+            #   dx =  sin(theta), dy = -cos(theta)
+            if det.visual_angle is not None:
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                length = max(8.0, min(x2 - x1, y2 - y1) * 0.4)
+                theta = math.radians(det.visual_angle)
+                dx = math.sin(theta) * length
+                dy = -math.cos(theta) * length
+                draw.line(
+                    [(cx, cy), (cx + dx, cy + dy)],
+                    fill=color,
+                    width=3,
+                )
 
         mask_pixels = int(mask_np.sum() // 255) if mask_np is not None else 0
         info = (
@@ -267,7 +299,7 @@ def _update_debug(
             f"{len(detections)} det  {mask_pixels}px mask  "
             f"{orig_pil.width}x{orig_pil.height}"
         )
-        draw.rectangle([0, 0, len(info) * 7 + 4, 16], fill=(0, 0, 0, 160))
+        draw.rectangle([0, 0, len(info) * 7 + 4, 16], fill=(0, 0, 0))
         draw.text((2, 1), info, fill=(255, 255, 0), font=font)
 
         buf = io.BytesIO()
@@ -283,7 +315,12 @@ def _update_debug(
                 "width": orig_pil.width,
                 "height": orig_pil.height,
                 "detections": [
-                    {"box": d.box, "score": d.score, "label": d.label}
+                    {
+                        "box": d.box,
+                        "label": d.label,
+                        "confidence": d.confidence,
+                        "visual_angle": d.visual_angle,
+                    }
                     for d in detections
                 ],
             }
@@ -307,70 +344,3 @@ def debug_json() -> Any:
     if meta is None:
         raise HTTPException(status_code=404, detail="no frame processed yet")
     return meta
-
-
-# ---------------------------------------------------------------------------
-# L3 — Claude semantic classification
-# ---------------------------------------------------------------------------
-# Separate from /detect on purpose: L1+L2 (above) return in tens-to-hundreds
-# of ms; L3 calls a remote LLM and takes 1-3s per batch. Keeping them on
-# different endpoints lets the SLAM client run L1+L2 every frame and only
-# trigger L3 every Nth frame.
-
-class L3Box(BaseModel):
-    id: int = Field(..., description="caller-assigned box id, returned 1:1 in classifications")
-    box: list[float] = Field(..., description="[x1,y1,x2,y2] in image pixels")
-
-
-class L3Frame(BaseModel):
-    request_id: int
-    image_jpeg_b64: str
-    boxes: list[L3Box]
-
-
-class ClassifyBatchRequest(BaseModel):
-    frames: list[L3Frame] = Field(..., description="up to 5 frames per call")
-
-
-@app.post("/classify_batch")
-def classify_batch(req: ClassifyBatchRequest) -> dict[str, Any]:
-    if _classifier is None:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "L3 disabled: set GEMINI_API_KEY (or GOOGLE_API_KEY) and "
-                "restart the service"
-            ),
-        )
-    if not req.frames:
-        raise HTTPException(status_code=400, detail="frames must be non-empty")
-    if len(req.frames) > 5:
-        raise HTTPException(status_code=400, detail="at most 5 frames per call")
-
-    frames: list[dict[str, Any]] = []
-    for f in req.frames:
-        try:
-            raw = base64.b64decode(f.image_jpeg_b64, validate=False)
-            pil = Image.open(io.BytesIO(raw)).convert("RGB")
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"frame request_id={f.request_id} bad jpeg: {e}",
-            ) from e
-        frames.append({
-            "request_id": f.request_id,
-            "image": pil,
-            "boxes": [{"id": b.id, "box": b.box} for b in f.boxes],
-        })
-
-    t0 = time.perf_counter()
-    try:
-        out = _classifier.classify_batch(frames)
-    except Exception as e:
-        import traceback
-        print(f"[semantic_service] /classify_batch FAILED: "
-              f"{type(e).__name__}: {e}", flush=True)
-        traceback.print_exc()
-        raise HTTPException(status_code=502, detail=f"gemini api error: {e}") from e
-    out["inference_ms"] = int((time.perf_counter() - t0) * 1000.0)
-    return out

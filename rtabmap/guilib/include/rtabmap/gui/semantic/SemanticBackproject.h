@@ -67,6 +67,40 @@ inline bool rayPlaneIntersect(
     return true;
 }
 
+// Convert an image-plane visual angle (LLM output) into a world-frame
+// direction bin in {1..8}, following the prompt.md convention:
+//   bin 1 = +Y_world (north), bin 3 = +X_world (east),
+//   bin 5 = -Y_world (south), bin 7 = -X_world (west); CW from north.
+//
+// Inputs:
+//   visualAngleDeg : [0, 360), CW from image-up. 0 = arrow points to image
+//                    top, 90 = points right, 180 = points down, 270 = left.
+//   robotYawRad    : robot heading, CCW from world +X (rtabmap Transform::theta()).
+//
+// Simplifying assumption: camera roll/pitch are small, so image-up roughly
+// aligns with robot-forward (+X_base) and image-right with -Y_base. Floor
+// arrows under significant camera tilt will incur a sub-bin error which is
+// usually absorbed by the 45° quantization.
+inline int imageAngleToWorldDirBin(float visualAngleDeg, float robotYawRad)
+{
+    // 180/π — defined locally so we don't depend on _USE_MATH_DEFINES.
+    constexpr float kRadToDeg = 57.2957795130823208f;
+
+    // image cw-from-up == base cw-from-forward (under the no-roll assumption).
+    // World CCW yaw of arrow = robot yaw (CCW) - image angle (CW).
+    const float worldCcwDeg = robotYawRad * kRadToDeg - visualAngleDeg;
+
+    // Re-express as "clockwise from world north" for bin lookup.
+    //   north (+Y) is CCW 90° from east (+X), so cwFromNorth = 90 - ccwFromEast.
+    float cwFromNorth = 90.0f - worldCcwDeg;
+    cwFromNorth = std::fmod(cwFromNorth, 360.0f);
+    if (cwFromNorth < 0.0f) cwFromNorth += 360.0f;
+
+    int idx = static_cast<int>(std::lround(cwFromNorth / 45.0f)) % 8;
+    if (idx < 0) idx += 8;
+    return idx + 1;  // 1..8
+}
+
 }  // namespace semantic
 
 #endif /* SEMANTICBACKPROJECT_H_ */

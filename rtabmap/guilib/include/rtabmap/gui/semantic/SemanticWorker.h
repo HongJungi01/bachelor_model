@@ -1,24 +1,22 @@
 /*
  * SemanticWorker.h
  *
- * Background worker that consumes (nodeId, rgb) frames at a low rate (~1 Hz),
- * runs the two-stage semantic pipeline, and posts per-box labels back through
- * a callback. The submit() interface is latest-only: prior pending frames are
- * dropped, which keeps the SLAM thread non-blocking and trades freshness for
- * throughput.
+ * Background worker that consumes (nodeId, rgb) frames at a low rate,
+ * runs the single-call LLM pipeline, and posts per-box LabeledBox
+ * results back through a callback. The submit() interface is latest-only:
+ * prior pending frames are dropped, which keeps the SLAM thread non-
+ * blocking and trades freshness for throughput.
  *
- * Two-stage pipeline:
- *   1. /detect          — Florence-2 + SAM, returns bounding boxes only.
- *                         Labels from Florence-2 are intentionally ignored.
- *   2. /classify_batch  — Gemini classifier. Up to 5 frames are buffered
- *                         and submitted in a single call to amortise
- *                         API latency. Returns a label + confidence +
- *                         visual_angle per box id.
+ * Pipeline (one network round-trip per keyframe):
+ *   /detect  — Python sidecar calls a single LLM (Gemini 3 Flash by
+ *              default; Claude Sonnet 4.6 alternative) which returns
+ *              boxes + labels + confidences + visual_angle in one shot.
+ *              SAM refines the boxes into a union mask before responding.
  *
- * The worker accumulates frames with non-empty box detections into a batch.
- * The batch is flushed when it hits BATCH_SIZE or after BATCH_TIMEOUT_MS of
- * idle. Frames with zero boxes short-circuit and dispatch an empty result
- * immediately.
+ * Because each /detect call goes through the LLM (~1-3 s), we rely on
+ * the latest-only submit() semantics for natural rate limiting: while a
+ * call is in flight, intermediate keyframes simply overwrite slot_ and
+ * are dropped. The most recent unprocessed frame is the next one taken.
  */
 
 #ifndef SEMANTICWORKER_H_
@@ -42,9 +40,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
-#include <array>
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -52,7 +48,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 class SemanticWorker
@@ -107,40 +102,16 @@ public:
     }
 
 private:
-    static constexpr size_t kBatchSize       = 5;
-    static constexpr int    kBatchTimeoutMs  = 1500;
-
-    // A frame that has cleared /detect and is waiting for /classify_batch.
-    // We keep the JPEG bytes around to avoid re-encoding when classifying.
-    struct PendingFrame {
-        int                  nodeId = -1;
-        std::vector<uint8_t> jpeg;        // raw JPEG (NOT base64)
-        std::vector<std::array<float,4>> boxes;  // x1,y1,x2,y2 in image pixels
-    };
-
     void loop()
     {
-        std::vector<PendingFrame> batch;
-        batch.reserve(kBatchSize);
-        auto lastFrameTime = std::chrono::steady_clock::now();
-
         while (true)
         {
             Frame frame;
-            bool  gotFrame  = false;
+            bool  gotFrame   = false;
             bool  shouldExit = false;
             {
                 std::unique_lock<std::mutex> lk(mtx_);
-                if (batch.empty())
-                {
-                    cv_.wait(lk, [this] { return hasFrame_ || !running_; });
-                }
-                else
-                {
-                    cv_.wait_for(lk,
-                                 std::chrono::milliseconds(kBatchTimeoutMs),
-                                 [this] { return hasFrame_ || !running_; });
-                }
+                cv_.wait(lk, [this] { return hasFrame_ || !running_; });
                 if (!running_ && !hasFrame_) shouldExit = true;
                 if (hasFrame_)
                 {
@@ -151,49 +122,24 @@ private:
                 }
             }
 
-            if (shouldExit)
+            if (shouldExit) return;
+            if (!gotFrame) continue;
+
+            if (mode_ == Mode::Mock)
             {
-                if (!batch.empty()) flushBatch(batch);
-                return;
+                handleMock(frame);
+                continue;
             }
 
-            if (gotFrame)
+            std::vector<LabeledBox> labeled;
+            if (httpDetect(frame, labeled))
             {
-                if (mode_ == Mode::Mock)
-                {
-                    handleMock(frame);
-                }
-                else
-                {
-                    PendingFrame pf;
-                    if (httpDetect(frame, pf))
-                    {
-                        if (pf.boxes.empty())
-                        {
-                            // No detections — dispatch empty immediately.
-                            if (callback_) callback_(frame.nodeId, {});
-                        }
-                        else
-                        {
-                            batch.push_back(std::move(pf));
-                            lastFrameTime = std::chrono::steady_clock::now();
-                        }
-                    }
-                }
+                if (callback_) callback_(frame.nodeId, labeled);
             }
-
-            if (batch.size() >= kBatchSize)
+            else
             {
-                flushBatch(batch);
-            }
-            else if (!batch.empty())
-            {
-                auto idleMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  std::chrono::steady_clock::now() - lastFrameTime).count();
-                if (idleMs >= kBatchTimeoutMs)
-                {
-                    flushBatch(batch);
-                }
+                // Dispatch empty so MaskStore entries don't sit pending forever.
+                if (callback_) callback_(frame.nodeId, {});
             }
         }
     }
@@ -215,10 +161,11 @@ private:
 
     // ---- /detect ---------------------------------------------------------
 
-    // Calls /detect, fills out.boxes (image-pixel coords) and out.jpeg.
-    // Florence-2 labels are intentionally NOT propagated — L3 (Gemini) is
-    // the only source of truth for labels.
-    bool httpDetect(const Frame & frame, PendingFrame & out)
+    // Calls /detect once. The Python sidecar runs the LLM (and SAM mask
+    // refinement) and returns boxes + labels + confidences + visual_angle
+    // in a single response. Returns false on transport / parse error;
+    // returns true with an empty `out` when the LLM saw nothing of interest.
+    bool httpDetect(const Frame & frame, std::vector<LabeledBox> & out)
     {
         if (!ensureClient()) return false;
 
@@ -231,11 +178,9 @@ private:
         }
 
         const std::string b64 = base64Encode(jpeg.data(), jpeg.size());
-
-        // Server uses its default prompt; we deliberately don't send one.
         nlohmann::json body = {
             {"image_jpeg_b64", b64},
-            {"request_id",     reqIdCounter_.fetch_add(1)},
+            {"request_id",     frame.nodeId},
         };
 
         auto res = client_->Post(detectPath_.c_str(),
@@ -263,142 +208,25 @@ private:
                     if (!d.contains("box")) continue;
                     const auto & b = d["box"];
                     if (!b.is_array() || b.size() < 4) continue;
-                    out.boxes.push_back({
-                        b[0].get<float>(), b[1].get<float>(),
-                        b[2].get<float>(), b[3].get<float>(),
-                    });
+                    LabeledBox lb;
+                    lb.x1 = b[0].get<float>();
+                    lb.y1 = b[1].get<float>();
+                    lb.x2 = b[2].get<float>();
+                    lb.y2 = b[3].get<float>();
+                    lb.label       = d.value("label", "");
+                    lb.confidence  = d.value("confidence", 0.0f);
+                    if (d.contains("visual_angle") && !d["visual_angle"].is_null())
+                        lb.visualAngle = d["visual_angle"].get<float>();
+                    out.push_back(std::move(lb));
                 }
             }
             const int infMs = j.value("inference_ms", -1);
             UDEBUG("SemanticWorker: /detect node=%d boxes=%zu inference_ms=%d",
-                   frame.nodeId, out.boxes.size(), infMs);
+                   frame.nodeId, out.size(), infMs);
         }
         catch (const std::exception & e)
         {
             UWARN("SemanticWorker: /detect JSON parse failed: %s", e.what());
-            return false;
-        }
-
-        out.nodeId = frame.nodeId;
-        out.jpeg.assign(jpeg.begin(), jpeg.end());
-        return true;
-    }
-
-    // ---- /classify_batch -------------------------------------------------
-
-    void flushBatch(std::vector<PendingFrame> & batch)
-    {
-        if (batch.empty()) return;
-
-        bool ok = httpClassifyBatch(batch);
-        if (!ok)
-        {
-            // On error, dispatch empty results so MaskStore entries don't
-            // sit in pending forever.
-            for (const auto & pf : batch)
-                if (callback_) callback_(pf.nodeId, {});
-        }
-        batch.clear();
-    }
-
-    // Builds the /classify_batch request, parses the response, and dispatches
-    // one callback per frame. Returns false on error (caller drops the batch).
-    bool httpClassifyBatch(const std::vector<PendingFrame> & batch)
-    {
-        if (!ensureClient()) return false;
-
-        nlohmann::json frames = nlohmann::json::array();
-        for (const auto & pf : batch)
-        {
-            nlohmann::json boxes = nlohmann::json::array();
-            for (size_t i = 0; i < pf.boxes.size(); ++i)
-            {
-                const auto & b = pf.boxes[i];
-                boxes.push_back({
-                    {"id",  static_cast<int>(i)},
-                    {"box", {b[0], b[1], b[2], b[3]}},
-                });
-            }
-            frames.push_back({
-                {"request_id",     pf.nodeId},
-                {"image_jpeg_b64", base64Encode(pf.jpeg.data(), pf.jpeg.size())},
-                {"boxes",          boxes},
-            });
-        }
-
-        nlohmann::json body = {{"frames", frames}};
-        auto res = client_->Post(classifyPath_.c_str(),
-                                  body.dump(), "application/json");
-        if (!res)
-        {
-            UWARN("SemanticWorker: /classify_batch POST failed");
-            return false;
-        }
-        if (res->status != 200)
-        {
-            UWARN("SemanticWorker: /classify_batch status=%d body=%.200s",
-                  res->status, res->body.c_str());
-            return false;
-        }
-
-        // Response shape:
-        //   { result: { frames: [{request_id, classifications: [{id,label,confidence,visual_angle}]}] },
-        //     usage: {...}, inference_ms: int }
-        try
-        {
-            auto j = nlohmann::json::parse(res->body);
-            const int infMs = j.value("inference_ms", -1);
-
-            const auto & framesOut = j.at("result").at("frames");
-
-            // Index batch by request_id (== nodeId) for fast lookup.
-            std::unordered_map<int, const PendingFrame*> byNode;
-            for (const auto & pf : batch) byNode[pf.nodeId] = &pf;
-
-            int dispatched = 0;
-            for (const auto & f : framesOut)
-            {
-                const int nodeId = f.value("request_id", -1);
-                auto it = byNode.find(nodeId);
-                if (it == byNode.end()) continue;
-
-                const PendingFrame & pf = *it->second;
-                std::vector<LabeledBox> labeled;
-                labeled.reserve(pf.boxes.size());
-
-                if (f.contains("classifications") && f["classifications"].is_array())
-                {
-                    for (const auto & c : f["classifications"])
-                    {
-                        const int id = c.value("id", -1);
-                        if (id < 0 || id >= static_cast<int>(pf.boxes.size())) continue;
-                        const auto & b = pf.boxes[id];
-                        LabeledBox lb;
-                        lb.x1 = b[0]; lb.y1 = b[1]; lb.x2 = b[2]; lb.y2 = b[3];
-                        lb.label       = c.value("label", "");
-                        lb.confidence  = c.value("confidence", 0.0f);
-                        if (c.contains("visual_angle") && !c["visual_angle"].is_null())
-                            lb.visualAngle = c["visual_angle"].get<float>();
-                        labeled.push_back(std::move(lb));
-                    }
-                }
-
-                if (callback_) callback_(nodeId, labeled);
-                byNode.erase(it);
-                ++dispatched;
-            }
-
-            // Any frames not present in the response — dispatch empty so
-            // mask store entries don't leak.
-            for (const auto & kv : byNode)
-                if (callback_) callback_(kv.first, {});
-
-            UDEBUG("SemanticWorker: /classify_batch dispatched=%d/%zu inference_ms=%d",
-                   dispatched, batch.size(), infMs);
-        }
-        catch (const std::exception & e)
-        {
-            UWARN("SemanticWorker: /classify_batch JSON parse failed: %s", e.what());
             return false;
         }
         return true;
@@ -411,8 +239,7 @@ private:
         if (client_) return true;
 
         // url_ may include a path (legacy: ".../detect"). We strip it and
-        // hard-wire endpoint paths instead so both /detect and
-        // /classify_batch share one connection.
+        // hard-wire the endpoint path instead.
         if (!parseUrl(url_, host_, port_))
         {
             UERROR("SemanticWorker: bad RTABMAP_SEMANTIC_URL '%s' "
@@ -423,11 +250,12 @@ private:
         client_ = std::make_unique<httplib::Client>(host_, port_);
         client_->set_keep_alive(true);
         client_->set_connection_timeout(5, 0);
-        client_->set_read_timeout(15, 0);   // /classify_batch is slow
+        // /detect now goes through the LLM + SAM, so it can take several
+        // seconds. Keep this generous.
+        client_->set_read_timeout(30, 0);
         client_->set_write_timeout(5, 0);
-        UINFO("SemanticWorker: HTTP client ready -> %s:%d (paths %s, %s)",
-              host_.c_str(), port_,
-              detectPath_.c_str(), classifyPath_.c_str());
+        UINFO("SemanticWorker: HTTP client ready -> %s:%d (path %s)",
+              host_.c_str(), port_, detectPath_.c_str());
         return true;
     }
 
@@ -505,9 +333,7 @@ private:
     std::unique_ptr<httplib::Client> client_;
     std::string                      host_;
     int                              port_ = 0;
-    std::string                      detectPath_   = "/detect";
-    std::string                      classifyPath_ = "/classify_batch";
-    std::atomic<int>                 reqIdCounter_{0};
+    std::string                      detectPath_ = "/detect";
 };
 
 #endif /* SEMANTICWORKER_H_ */

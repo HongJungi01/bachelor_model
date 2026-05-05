@@ -14,7 +14,7 @@
 3. [RTAB-Map 빌드](#3-rtab-map-빌드)
 4. [실행](#4-실행)
 5. [Unity TCP 모드로 SLAM 돌리기](#5-unity-tcp-모드로-slam-돌리기)
-6. [Semantic SLAM (Florence-2 + SAM + Gemini 사이드카)](#6-semantic-slam-florence-2--sam--gemini-사이드카)
+6. [Semantic SLAM (1-stage LLM + SAM 사이드카)](#6-semantic-slam-1-stage-llm--sam-사이드카)
 7. [Unity 측 설정 (`unityCar`)](#7-unity-측-설정-unitycar)
 8. [트러블슈팅](#8-트러블슈팅)
 9. [프로젝트 구조](#9-프로젝트-구조)
@@ -30,8 +30,8 @@
 | CMake         | 3.20+                                | VS2022 번들 사용 가능 (별도 설치 가능)           |
 | Unity         | 2022.3 LTS (DX11)                    | Unity TCP 모드만 사용                            |
 | Python 3.11+  | Semantic 사이드카용                  | venv 자동 생성, GPU torch는 cu121 휠 권장        |
-| NVIDIA GPU    | Semantic SLAM 사용 시                 | 4GB+ (Florence-2 + SAM 동시 로드)               |
-| Gemini API 키 | L3 분류 사용 시                       | Google AI Studio에서 발급, `.env.bat`에 저장    |
+| NVIDIA GPU    | Semantic SLAM 사용 시                 | 2GB+ (SAM만 로컬, LLM은 클라우드)              |
+| LLM API 키    | Semantic 사용 시 필수                 | Gemini(기본) 또는 Anthropic, `.env.bat`에 저장 |
 
 ---
 
@@ -197,67 +197,80 @@ Apply → OK.
 
 ---
 
-## 6. Semantic SLAM (Florence-2 + SAM + Gemini 사이드카)
+## 6. Semantic SLAM (1-stage LLM + SAM 사이드카)
 
-주차장 내 의미 있는 구조물(기둥, 주차선, 출구 표지 등)을 감지해 2D occupancy grid에 레이어로 태깅한다. 3단계 파이프라인으로 구성되며, 사이드카 프로세스(`run_semantic.bat`)를 켜야 동작한다.
+주차장 내 의미 있는 구조물(기둥, 주차선, 출구, 화살표 등)을 감지해 2D occupancy grid에 레이어로 태깅한다. LLM 한 번 호출에 박스+라벨+방향을 모두 받는 단일-호출 파이프라인이며, 사이드카 프로세스(`run_semantic.bat`)를 켜야 동작한다.
 
 ### 6-1. 파이프라인 구조
 
 ```
 [RTAB-Map GUI]
    │
-   │  POST /detect  (keyframe JPEG)
+   │  POST /detect  (keyframe JPEG, request_id = nodeId)
    ▼
 [semantic_service (FastAPI, port 7788)]
    │
-   ├─ L1+L2: Florence-2 (CAPTION_TO_PHRASE_GROUNDING) → 바운딩 박스
-   │          SAM → 박스에서 픽셀 마스크 생성
-   │          ↳ 응답: boxes (좌표) + mask_png_b64
+   ├─ LLM (Gemini 3 Flash 기본 / Claude Sonnet 4.6 옵션)
+   │     입력: 1장의 keyframe JPEG
+   │     출력: detections[{box, label, confidence, visual_angle?}]
    │
-   └─ L3:  POST /classify_batch  (JPEG + 박스 ID, 최대 5 프레임 묶음)
-           Gemini 3.1 Flash Lite → 박스별 label + confidence + visual_angle
-           ↳ 응답: classifications [{box_id, label, confidence, visual_angle}]
+   └─ SAM 후처리: 각 box → 픽셀 마스크, union을 PNG로 인코딩
+        ↳ 응답: detections + mask_png_b64
 
 [SemanticWorker (C++)]
-   ├─ /detect 응답: 박스를 PendingFrame 버퍼에 적재
-   └─ 5프레임 도달 or 1500ms 타임아웃 → /classify_batch 배치 전송
-      응답 도착 시 ResultCallback 호출 → SemanticMaskStore에 LabeledBox 등록
+   ├─ submit()는 latest-only — 처리 중에는 들어오는 keyframe이 자연스레 throttle됨
+   └─ /detect 응답 → ResultCallback → SemanticMaskStore.setLabeledBoxes()
 
 [SemanticMaskStore]
-   ├─ LabeledBox → 레이블별 grid code 변환
+   ├─ resolveGridCode(label, visual_angle, robotYaw)
    │     pillar / parking_line / traffic_cone / no_entry_sign / construction_sign → 1
-   │     exit_area → 10
+   │     exit_area                                                                 → 10
+   │     exit_sign / floor_arrow (+ 방향 bin 1..8)                                 → 11..18
+   │     one_way_marker (+ 방향 bin 1..8)                                          → 21..28
+   │     lane_divider / intersection / 그 외                                       → 0 (skip)
    └─ applyTo(grid): pose × camPoints → 2D 셀에 코드 기록
 ```
 
-**핵심 설계**: L1+L2(Florence-2+SAM)는 영역만 분리하고 레이블을 붙이지 않는다. 레이블 할당은 L3(Gemini)만 한다. L3가 비동기로 도착하기 전까지는 이전 결과가 그대로 유지된다.
+**핵심 설계**: LLM 한 번이 박스 검출 + 라벨링 + 방향 추정을 모두 처리한다. 별도 클래시파이어 단계가 없어 단순하고, 모호한 사례(주차선 vs 중앙 분리선) 판단을 LLM 추론력에 직접 맡길 수 있다. 트레이드오프는 매 호출이 1~3초가 걸린다는 점 — `submit()` latest-only 시멘틱이 자연스레 keyframe rate를 제한한다.
+
+**방향 코드**: `visual_angle`은 image-plane 각도(0=위, 시계방향)다. C++ 쪽 `imageAngleToWorldDirBin()`이 robot pose의 yaw로 회전시켜 world-frame 8-bin(prompt.md 컨벤션: bin 1=북, 시계방향)으로 양자화한다.
 
 ### 6-2. Grid 셀 값
 
-| 값  | 의미 | 색상 (grid_client.py) |
-|-----|------|----------------------|
-| -1  | 미탐색 (unknown)       | 회색 (128,128,128) |
-|  0  | 빈 공간 (free)         | 흰색 (255,255,255) |
-|  1  | 벽면형 구조물          | 빨강 BGR (40,40,220) |
-| 10  | 목적지 (출구 구역)     | 초록 BGR (60,200,60) |
-| 100 | 동적 장애물 (RTAB-Map) | 검정 (0,0,0) |
+| 값       | 의미                                 | 색상 (grid_client.py)       |
+|----------|--------------------------------------|-----------------------------|
+| -1       | 미탐색 (unknown)                     | 회색 (128,128,128)          |
+|  0       | 빈 공간 (free)                       | 흰색 (255,255,255)          |
+|  1       | 벽면형 구조물                        | 빨강 BGR (40,40,220)        |
+| 10       | 목적지 (exit_area)                   | 초록 BGR (60,200,60)        |
+| 11..18   | 목적지 방향성 표지 (10 + dirBin)     | 시안 BGR (220,200,60)       |
+| 21..28   | 일방통행 영역 (20 + dirBin)          | 마젠타 BGR (200,60,200)     |
+| 100      | 동적 장애물 (RTAB-Map)               | 검정 (0,0,0)                |
 
-### 6-3. 사전 준비 — Gemini API 키 설정
+dirBin 컨벤션: 1=(0,+Y), 2=(+X,+Y), 3=(+X,0), 4=(+X,-Y), 5=(0,-Y), 6=(-X,-Y), 7=(-X,0), 8=(-X,+Y) — 시계방향, world frame.
 
-L3(Gemini 분류)를 사용하려면 API 키가 필요하다. 없으면 L1+L2 박스 감지만 동작한다.
+### 6-3. 사전 준비 — LLM API 키 설정
 
-1. [Google AI Studio](https://aistudio.google.com/apikey)에서 키 발급
+LLM 호출이 파이프라인의 전부이므로 API 키 없이는 `/detect`가 503을 돌려준다. Gemini(기본) 또는 Anthropic 중 하나만 있으면 된다.
+
+1. **Gemini (기본)** — [Google AI Studio](https://aistudio.google.com/apikey)에서 키 발급
+   **Anthropic (옵션)** — [Anthropic Console](https://console.anthropic.com/)에서 키 발급
 2. `semantic_service/.env.bat.example`을 복사해서 `.env.bat` 생성:
 
 ```powershell
 Copy-Item C:\dev\semantic_service\.env.bat.example C:\dev\semantic_service\.env.bat
 ```
 
-3. `.env.bat` 열어서 키 입력:
+3. `.env.bat`을 열어서 사용할 provider의 키만 채운다:
 
 ```bat
 @echo off
+rem -- Gemini (기본) --
 set GEMINI_API_KEY=YOUR_KEY_HERE
+
+rem -- Claude로 바꾸려면 위는 비우고 아래 두 줄을 활성화 --
+rem set LLM_PROVIDER=anthropic
+rem set ANTHROPIC_API_KEY=YOUR_KEY_HERE
 ```
 
 `.env.bat`은 `.gitignore`에 등록되어 있어 커밋되지 않는다.
@@ -268,22 +281,23 @@ set GEMINI_API_KEY=YOUR_KEY_HERE
 C:\dev\semantic_service\run_semantic.bat
 ```
 
-첫 실행 시 `semantic_service\.venv`를 만들고 `requirements.txt`를 설치한다. HuggingFace 가중치는 첫 추론 시 자동 다운로드:
-- `microsoft/Florence-2-base` (~1.5GB)
+첫 실행 시 `semantic_service\.venv`를 만들고 `requirements.txt`를 설치한다. SAM 가중치는 첫 추론 시 자동 다운로드:
 - `facebook/sam-vit-base` (~360MB)
+
+LLM 자체는 클라우드에서 도는 외부 호출이라 로컬 다운로드가 없다.
 
 기동 완료 로그:
 
 ```
-[semantic_service] L1+L2 loaded on device=cuda (florence=microsoft/Florence-2-base, sam=facebook/sam-vit-base)
-[semantic_service] L3 Gemini classifier loaded (model=gemini-3.1-flash-lite-preview)
+[semantic_service] SAM loaded on device=cuda (model=facebook/sam-vit-base)
+[semantic_service] LLM ready: gemini (gemini-3-flash)
 INFO:     Uvicorn running on http://127.0.0.1:7788
 ```
 
-L3가 비활성(키 없음)이면:
+키가 없거나 잘못된 provider면:
 
 ```
-[semantic_service] L3 disabled — set GEMINI_API_KEY (or GOOGLE_API_KEY) to enable /classify_batch
+[semantic_service] LLM disabled — set GEMINI_API_KEY (LLM_PROVIDER=gemini) to enable /detect
 ```
 
 기본 venv는 **CPU torch**가 깔린다. GPU(권장)를 쓰려면 한 번만 수동 교체:
@@ -307,20 +321,17 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 | `http://127.0.0.1:7788/debug_json`  | 마지막 /detect 결과 요약 (JSON) |
 | `http://127.0.0.1:7788/healthz`     | 서비스 상태 + 모델 로드 여부 |
 
-### 6-7. 프롬프트 / 임계치 변경
+### 6-7. 카탈로그 / 프롬프트 변경
 
-`app.py`의 `DetectRequest` 기본값을 수정하면 Florence-2가 찾는 객체 유형을 바꿀 수 있다:
+검출 카테고리 정의는 `semantic_service/llm_runner.py`의 `_SYSTEM_PROMPT`와 `LABELS` 튜플에 모여 있다. 라벨을 추가하려면:
 
-```python
-prompt = (
-    "parking stall lines, exit signs, pillars, traffic cones, "
-    "no entry signs, construction signs, floor direction arrows"
-)
-box_threshold  = 0.3
-text_threshold = 0.25
-```
+1. `LABELS`에 새 라벨 문자열 추가
+2. `_SYSTEM_PROMPT`의 "Category catalog" 섹션에 정의/디스앰비귀에이션 규칙 작성
+3. (방향성 라벨이라면) `DIRECTIONAL_LABELS`에도 추가
+4. C++ `SemanticMaskStore::resolveGridCode()`에 새 라벨 → 그리드 코드 매핑 추가
+5. (필요시) `priorityOf()`에 우선순위 추가
 
-Florence-2 CAPTION_TO_PHRASE_GROUNDING은 쉼표(`,`)로 구문을 구분한다.
+라벨 카탈로그와 그리드 코드 매핑은 항상 짝으로 변경해야 한다 (Python은 무시되는 라벨을 보내고, C++은 받지 못한 라벨을 그릴 수 없다).
 
 ### 6-8. 점유 그리드 실시간 확인 (grid_client.py)
 
@@ -405,22 +416,27 @@ Header (5B): [type:u8][payloadSize:u32]   ── little-endian
 
 → ① `semantic_service`가 안 켜져 있음 — `run_semantic.bat` 콘솔에 `Uvicorn running on ...:7788`이 떠야 한다. ② `RTABMAP_SEMANTIC_URL`이 `run_rtabmap.bat`에서 비어 있음. ③ keyframe이 아직 없음 — Start 직후엔 정상.
 
-### Semantic: `/classify_batch` 502 에러
+### Semantic: `/detect` 502/503 에러
 
-→ Gemini API 키 문제. 원인:
-- `.env.bat`가 없음 → [6-3](#6-3-사전-준비--gemini-api-키-설정) 참고
-- 키가 만료/유출됨 → Google AI Studio에서 새 키 발급 후 `.env.bat` 수정
+→ LLM API 문제. 원인:
+- `.env.bat`가 없거나 키 빈 값 → [6-3](#6-3-사전-준비--llm-api-키-설정) 참고. `/healthz`가 `model_loaded=false`면 키가 안 잡힌 것.
+- `LLM_PROVIDER`가 `anthropic`인데 `ANTHROPIC_API_KEY`가 없거나 그 반대 — `.env.bat` 다시 확인
+- 키가 만료/유출됨 → 콘솔에서 새 키 발급 후 `.env.bat` 수정
 - 키 발급 직후 활성화까지 수십 초 걸릴 수 있음
 
-`semantic_service` 콘솔에 `403 PERMISSION_DENIED` 또는 `reported as leaked`가 보이면 키를 새로 발급해야 한다.
+`semantic_service` 콘솔에 `403 PERMISSION_DENIED`(Gemini) 또는 `authentication_error`(Anthropic)가 보이면 키를 새로 발급한다.
 
 ### Semantic: GPU 안 잡힘 (`device=cpu` 로그)
 
 → venv의 torch가 CPU 휠. [6-4](#6-4-사이드카-실행) 의 cu121 휠 수동 교체 절차 참고.
 
-### Semantic: 모델 다운로드가 너무 느림
+### Semantic: SAM 다운로드가 너무 느림
 
-→ HuggingFace 네트워크 속도 문제. `HUGGINGFACE_HUB_CACHE` 환경변수로 캐시 경로를 빠른 드라이브로 지정하거나, 다운로드 완료 후 재시작하면 캐시에서 로드된다.
+→ HuggingFace 네트워크 속도 문제. `HUGGINGFACE_HUB_CACHE` 환경변수로 캐시 경로를 빠른 드라이브로 지정하거나, 다운로드 완료 후 재시작하면 캐시에서 로드된다. SAM-base는 ~360MB.
+
+### Semantic: `/detect`가 너무 느려서 차량을 따라가지 못함
+
+→ LLM 호출 1회당 1~3초 — 정상이다. SemanticWorker는 `submit()` latest-only이므로 처리 중 들어오는 keyframe은 자연스레 폐기된다. 효과적인 semantic 업데이트 주기는 약 0.3~0.5 Hz. 더 빠른 응답이 필요하면 더 가벼운 모델(예: `GEMINI_MODEL=gemini-3-flash-lite-preview`)로 교체.
 
 ---
 
@@ -441,24 +457,23 @@ C:\dev\
 │   │   │   ├── PreferencesDialog.h     (kSrcUnityTCP enum)
 │   │   │   ├── MainWindow.h            (semantic worker/store 멤버)
 │   │   │   └── semantic/                ★ Semantic SLAM
-│   │   │       ├── SemanticLabeledBox.h     (LabeledBox 구조체: label, confidence, visual_angle)
-│   │   │       ├── SemanticWorker.h         (HTTP 비동기 워커: /detect + /classify_batch 배치)
-│   │   │       ├── SemanticMaskStore.h      (camPoints 캐시 + applyTo, 코드 1/10)
-│   │   │       └── SemanticBackproject.h    (depth/ray-plane 헬퍼)
+│   │   │       ├── SemanticLabeledBox.h     (POD: label, confidence, visualAngle)
+│   │   │       ├── SemanticWorker.h         (HTTP 워커: /detect 단일 호출)
+│   │   │       ├── SemanticMaskStore.h      (camPoints 캐시 + applyTo, 코드 1/10/11..18/21..28)
+│   │   │       └── SemanticBackproject.h    (depth/ray-plane + imageAngleToWorldDirBin)
 │   │   └── src/
 │   │       ├── MainWindow.cpp           (semantic 통합 + grid raster)
 │   │       ├── PreferencesDialog.cpp    (Unity TCP UI)
 │   │       └── CMakeLists.txt           (nlohmann_json 링크)
 │   └── build/                   ← (gitignore) cmake build
 │
-├── semantic_service/            ★ Florence-2 + SAM + Gemini 사이드카 (FastAPI)
+├── semantic_service/            ★ 1-stage LLM + SAM 사이드카 (FastAPI)
 │   ├── run_semantic.bat         (venv + uvicorn 자동 부팅, .env.bat 로드)
-│   ├── .env.bat                 (gitignore) GEMINI_API_KEY 설정
+│   ├── .env.bat                 (gitignore) LLM API 키 설정
 │   ├── .env.bat.example         키 설정 템플릿 (커밋됨)
-│   ├── app.py                   (POST /detect, POST /classify_batch, GET /debug_image)
-│   ├── florence_runner.py       (L2: Florence-2 CAPTION_TO_PHRASE_GROUNDING)
-│   ├── gemini_runner.py         (L3: Gemini 분류기, label+confidence+visual_angle)
-│   ├── sam_runner.py            (L2: SAM 박스→픽셀 마스크)
+│   ├── app.py                   (POST /detect, GET /debug_image, /debug_json, /healthz)
+│   ├── llm_runner.py            (Gemini 3 Flash / Claude Sonnet 4.6 단일 호출, 카탈로그 정의)
+│   ├── sam_runner.py            (SAM 박스→픽셀 마스크)
 │   └── requirements.txt
 │
 ├── unityCar/                    ← Unity 자산 (Assets/에 복사)
