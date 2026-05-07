@@ -41,9 +41,11 @@ from pydantic import BaseModel, Field
 from llm_runner import DIRECTIONAL_LABELS, LlmRunner, maybe_create_runner
 from sam_runner import SamRunner
 
-# Long edge after internal resize for SAM — keeps mask inference latency
-# bounded. The LLM still sees the original-resolution JPEG since Gemini
-# and Claude internally rescale their inputs anyway.
+# Long edge limits for the two stages.
+# LLM: 1280px keeps upload + processing under ~3s on Gemini Flash.
+#   Boxes are returned in LLM-image coords and scaled back to original.
+# SAM: 800px bounds local GPU latency.
+LLM_MAX_EDGE = 1280
 SAM_MAX_EDGE = 800
 
 _runner: LlmRunner | None = None
@@ -116,6 +118,8 @@ class DetectResponse(BaseModel):
     width: int
     height: int
     inference_ms: int
+    llm_ms: int = 0
+    sam_ms: int = 0
     detections: list[Detection]
     mask_png_b64: str | None = None
 
@@ -147,10 +151,22 @@ def detect(req: DetectRequest) -> DetectResponse:
 
     orig_w, orig_h = pil.size
 
+    # Downscale for LLM to reduce upload + API processing time.
+    llm_long = max(orig_w, orig_h)
+    if llm_long > LLM_MAX_EDGE:
+        llm_scale = LLM_MAX_EDGE / float(llm_long)
+        llm_pil = pil.resize(
+            (int(round(orig_w * llm_scale)), int(round(orig_h * llm_scale))),
+            Image.BILINEAR,
+        )
+    else:
+        llm_pil = pil
+        llm_scale = 1.0
+
     t0 = time.perf_counter()
 
     try:
-        llm_result = _runner.detect(pil)
+        llm_result = _runner.detect(llm_pil)
     except Exception as e:
         import traceback
         print(
@@ -160,11 +176,15 @@ def detect(req: DetectRequest) -> DetectResponse:
         traceback.print_exc()
         raise HTTPException(status_code=502, detail=f"llm error: {e}") from e
 
+    t_llm = time.perf_counter()
+    llm_ms = int((t_llm - t0) * 1000.0)
+
     detections: list[Detection] = []
     for d in llm_result.detections:
         if len(d.box) != 4:
             continue
-        x1, y1, x2, y2 = (float(v) for v in d.box)
+        # Scale boxes from LLM-image coords back to original resolution.
+        x1, y1, x2, y2 = (float(v) / llm_scale for v in d.box)
         if x2 < x1:
             x1, x2 = x2, x1
         if y2 < y1:
@@ -207,6 +227,7 @@ def detect(req: DetectRequest) -> DetectResponse:
         [d.box[0] / sx, d.box[1] / sy, d.box[2] / sx, d.box[3] / sy]
         for d in detections
     ]
+    t_sam0 = time.perf_counter()
     mask_small = _sam.segment(sam_pil, sam_boxes)
     if mask_small.shape != (orig_h, orig_w):
         mask_np = np.array(
@@ -215,7 +236,14 @@ def detect(req: DetectRequest) -> DetectResponse:
     else:
         mask_np = mask_small
 
+    sam_ms = int((time.perf_counter() - t_sam0) * 1000.0)
     infer_ms = int((time.perf_counter() - t0) * 1000.0)
+    print(
+        f"[semantic_service] req={req.request_id}  "
+        f"total={infer_ms}ms  llm={llm_ms}ms  sam={sam_ms}ms  "
+        f"det={len(detections)}",
+        flush=True,
+    )
 
     mask_b64: str | None = None
     if detections and int(mask_np.any()):
@@ -229,6 +257,8 @@ def detect(req: DetectRequest) -> DetectResponse:
         width=orig_w,
         height=orig_h,
         inference_ms=infer_ms,
+        llm_ms=llm_ms,
+        sam_ms=sam_ms,
         detections=detections,
         mask_png_b64=mask_b64,
     )

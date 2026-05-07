@@ -9,7 +9,7 @@ if not exist .venv (
     call .venv\Scripts\activate.bat
     echo [run_semantic] installing requirements ...
     pip install --upgrade pip
-    pip install -r requirements.txt
+    pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu128
     if errorlevel 1 goto :err
 ) else (
     call .venv\Scripts\activate.bat

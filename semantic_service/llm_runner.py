@@ -34,11 +34,7 @@ from pydantic import BaseModel
 
 LABELS = (
     "parking_line",
-    "lane_divider",
     "exit_sign",
-    "pillar",
-    "traffic_cone",
-    "no_entry_sign",
     "construction_sign",
     "floor_arrow",
     "exit_area",
@@ -78,14 +74,12 @@ interest.
     vehicle's slot. Length is roughly the depth of one parked car. One box
     per visible stall edge.
 
-- "lane_divider"
-    A line that runs PARALLEL to the direction of vehicle travel and
-    separates two driving lanes (or marks the centerline of a single
-    aisle). May be DASHED (most common) or a single long solid line. DOES
-    NOT bracket parking stalls. This is the #1 disambiguation target —
-    earlier versions of this pipeline mislabeled center dividers as
-    parking_line. If you see a dashed white line down the middle of an
-    aisle, it is lane_divider, never parking_line.
+    DO NOT label lane dividers / center lines as parking_line. A line that
+    runs PARALLEL to the direction of vehicle travel — including dashed
+    white lines down the middle of an aisle, or a solid centerline — is a
+    lane divider, NOT a parking_line. Lane dividers are NOT in the catalog,
+    so simply skip them (do not emit any box for them). When in doubt about
+    orientation, omit the box.
 
 - "exit_sign"
     A wall-, ceiling-, or beam-mounted illuminated EXIT marker (Korean:
@@ -93,21 +87,6 @@ interest.
     arrow that points toward the exit. Includes ground-floor "EXIT THIS
     WAY" placards. The physical sign object only — see exit_area for the
     floor region.
-
-- "pillar"
-    A structural concrete column rising from floor to ceiling, often
-    wrapped in yellow-and-black hazard tape near the base. Pillars block
-    traversal and become walls in the occupancy grid.
-
-- "traffic_cone"
-    Orange/red traffic cone (Korean: 꼬깔/고깔) standing on the floor, used
-    to block off areas, mark spills, or delimit construction. Generally
-    < 1m tall, conical. One box per cone.
-
-- "no_entry_sign"
-    Red circular "DO NOT ENTER" / "진입금지" sign — either painted on the
-    floor or mounted on a wall/post at the head of a one-way aisle. The
-    agent must treat the area beyond it as a wall.
 
 - "construction_sign"
     Yellow construction or maintenance warning sign / sandwich board /
@@ -136,10 +115,11 @@ interest.
 
 # Disambiguation rules (in priority order)
 
-1. parking_line vs lane_divider: judge by ORIENTATION of the line relative
+1. parking_line vs lane divider: judge by ORIENTATION of the line relative
    to the visible direction of travel of the nearest aisle. Perpendicular
-   = parking_line. Parallel = lane_divider. Dashed = almost always
-   lane_divider regardless of orientation.
+   to travel = parking_line (emit a box). Parallel to travel, or dashed,
+   = lane divider (skip — do NOT emit a box). When uncertain, prefer to
+   skip rather than mislabel as parking_line.
 
 2. exit_sign vs exit_area: exit_sign is the physical sign OBJECT;
    exit_area is the bounded floor REGION. They can both be present in the
@@ -149,17 +129,7 @@ interest.
    floor_arrow. A repeating arrow pattern, OR a "DO NOT ENTER" sign with
    arrows together, is one_way_marker. When in doubt, prefer floor_arrow.
 
-4. no_entry_sign vs construction_sign: red-circle "진입금지" is
-   no_entry_sign. Yellow caution / 작업중 / maintenance sign is
-   construction_sign. Both block traversal; the distinction matters for
-   downstream rule application.
-
-5. pillar vs other structures: pillars are concrete columns from floor to
-   ceiling. Steel beams crossing the ceiling are NOT pillars (don't emit
-   a box for those). A pillar wrapped in mirror or paint is still a
-   pillar.
-
-6. Tiny / blurry / occluded features: only emit a box if you are reasonably
+4. Tiny / blurry / occluded features: only emit a box if you are reasonably
    sure of the category. Honest omission is better than a confident wrong
    label. Use confidence < 0.5 to flag genuine uncertainty.
 
@@ -233,7 +203,7 @@ class _GeminiProvider:
         self._types = types
         self._genai = genai
         self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
-        self.model = model or os.environ.get("GEMINI_MODEL", "gemini-3-flash")
+        self.model = model or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
     @property
     def name(self) -> str:

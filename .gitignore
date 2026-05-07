@@ -69,3 +69,9 @@ grid.png
 semantic_service/.venv/
 semantic_service/__pycache__/
 
+# === Test inputs / outputs (local only) ===
+KakaoTalk_*.jpg
+KakaoTalk_*.mp4
+test_output_*.json
+test_output/
+
