@@ -27,7 +27,13 @@ if not exist models\best.pt (
     )
 )
 
-.venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 7788
+REM Bind host: defaults to 0.0.0.0 so remote RTAB-Map instances on the LAN
+REM can hit this service. Override with `set HOST=127.0.0.1` for loopback-only.
+REM Remember to open TCP %PORT% on Windows Firewall if accessing across the LAN.
+if "%HOST%"=="" set HOST=0.0.0.0
+if "%PORT%"=="" set PORT=7788
+echo [run_semantic] uvicorn listening on %HOST%:%PORT%
+.venv\Scripts\python.exe -m uvicorn app:app --host %HOST% --port %PORT%
 goto :eof
 
 :err

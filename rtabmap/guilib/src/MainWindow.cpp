@@ -104,6 +104,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QtCore/QProcess>
 #include <QSplashScreen>
 #include <QInputDialog>
+#include <QSettings>
 #include <QToolButton>
 
 //RGB-D stuff
@@ -465,6 +466,11 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	_ui->menuTools->addAction(_actionTcpGridStreaming);
 	connect(_actionTcpGridStreaming, SIGNAL(toggled(bool)), this, SLOT(toggleTcpGridStreaming(bool)));
 
+	// Semantic service URL (live-editable; persisted in QSettings)
+	_actionSemanticUrl = new QAction(tr("Set Semantic Service URL..."), this);
+	_ui->menuTools->addAction(_actionSemanticUrl);
+	connect(_actionSemanticUrl, SIGNAL(triggered()), this, SLOT(setSemanticServiceUrl()));
+
 	_ui->actionPause->setShortcut(Qt::Key_Space);
 	_ui->actionSave_GUI_config->setShortcut(QKeySequence::Save);
 	// Qt5 issue, we should explicitly add actions not in
@@ -769,33 +775,76 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 
 	this->setFocus();
 
-	// Semantic SLAM auto-init: if RTABMAP_SEMANTIC_URL env var is set, spawn
-	// the worker that POSTs each keyframe RGB to the semantic sidecar
-	// (single LLM call at /detect — Gemini 3 Flash by default, Claude Sonnet
-	// 4.6 alternative). Returned labeled boxes are rasterised into per-
-	// keyframe semantic masks and projected onto the grid just before TCP
-	// publish (codes: 1=wall-like, 10=exit_area, 11..18=dest direction,
-	// 21..28=one-way zone), so loop-closure pose corrections flow through
-	// automatically.
-	if (const char * url = std::getenv("RTABMAP_SEMANTIC_URL"))
-	{
-		if (url[0])
-		{
-			_semanticMasks  = std::unique_ptr<::SemanticMaskStore>(new ::SemanticMaskStore());
-			::SemanticMaskStore * masksPtr = _semanticMasks.get();
-			_semanticWorker = std::unique_ptr<::SemanticWorker>(new ::SemanticWorker(
-				::SemanticWorker::Mode::Http,
-				std::string(url),
-				[masksPtr](int nodeId,
-				           const std::vector<::semantic::LabeledBox> & boxes,
-				           const cv::Mat & mask) {
-					masksPtr->setLabeledBoxes(nodeId, boxes, mask);
-				}));
-			UINFO("MainWindow: semantic SLAM enabled via RTABMAP_SEMANTIC_URL=%s", url);
-		}
-	}
+	// Semantic SLAM auto-init: URL resolves from QSettings ("Semantic/url",
+	// set via Tools > Set Semantic Service URL...) first, then env var
+	// RTABMAP_SEMANTIC_URL. The YOLO sidecar tags centerLine / parkingLine
+	// pixels in each keyframe; SemanticMaskStore back-projects them and
+	// applyTo() rasterises code 1 (wall) into the published grid. Loop-
+	// closure pose corrections flow through automatically.
+	initSemanticWorker(resolveSemanticUrl());
 
 	UDEBUG("");
+}
+
+std::string MainWindow::resolveSemanticUrl() const
+{
+	QSettings settings;
+	const QString fromSettings = settings.value("Semantic/url", QString()).toString().trimmed();
+	if (!fromSettings.isEmpty())
+		return fromSettings.toStdString();
+	if (const char * env = std::getenv("RTABMAP_SEMANTIC_URL"))
+	{
+		if (env[0]) return std::string(env);
+	}
+	return std::string();
+}
+
+void MainWindow::initSemanticWorker(const std::string & url)
+{
+	// Tear down any existing worker first so its background thread joins
+	// before we replace state (avoids two workers racing on _semanticMasks).
+	_semanticWorker.reset();
+
+	if (url.empty())
+	{
+		_semanticMasks.reset();
+		UINFO("MainWindow: semantic SLAM disabled");
+		return;
+	}
+
+	if (!_semanticMasks)
+		_semanticMasks.reset(new ::SemanticMaskStore());
+	::SemanticMaskStore * masksPtr = _semanticMasks.get();
+	_semanticWorker.reset(new ::SemanticWorker(
+		::SemanticWorker::Mode::Http,
+		url,
+		[masksPtr](int nodeId,
+		           const std::vector<::semantic::LabeledBox> & boxes,
+		           const cv::Mat & mask) {
+			masksPtr->setLabeledBoxes(nodeId, boxes, mask);
+		}));
+	UINFO("MainWindow: semantic SLAM enabled via URL=%s", url.c_str());
+}
+
+void MainWindow::setSemanticServiceUrl()
+{
+	const QString current = QString::fromStdString(resolveSemanticUrl());
+	bool ok = false;
+	const QString next = QInputDialog::getText(
+		this,
+		tr("Semantic service URL"),
+		tr("Where RTAB-Map will POST each keyframe for /detect.\n"
+		   "Example: http://192.168.1.42:7788/detect\n"
+		   "Leave empty to disable."),
+		QLineEdit::Normal,
+		current,
+		&ok).trimmed();
+	if (!ok) return;
+
+	QSettings settings;
+	settings.setValue("Semantic/url", next);
+
+	initSemanticWorker(next.toStdString());
 }
 
 MainWindow::~MainWindow()

@@ -254,6 +254,10 @@ protected Q_SLOTS:
 	void toggleTcpGridStreaming(bool enabled);
 	void onTcpStatusMessage(const QString & msg);
 
+	// Semantic service URL (live-editable; persisted in QSettings under
+	// "Semantic/url"; env var RTABMAP_SEMANTIC_URL is the fallback)
+	void setSemanticServiceUrl();
+
 	// One-click source toggle (RealSense D455f ↔ Unity Images dataset)
 	void selectSourceRealSense();
 	void selectSourceUnityImages();
@@ -453,9 +457,15 @@ private:
 	GridTcpStreamer * _gridTcpStreamer;
 	QAction * _actionTcpGridStreaming;
 
-	// Semantic SLAM (parking line → wall tagging via async VLM sidecar)
+	// Semantic SLAM (parking line → wall tagging via async YOLO sidecar)
 	std::unique_ptr<::SemanticWorker>    _semanticWorker;
 	std::unique_ptr<::SemanticMaskStore> _semanticMasks;
+	QAction * _actionSemanticUrl;
+
+	// QSettings("Semantic/url") wins; falls back to env RTABMAP_SEMANTIC_URL.
+	std::string resolveSemanticUrl() const;
+	// Empty `url` tears the worker down. Otherwise (re)creates it.
+	void initSemanticWorker(const std::string & url);
 
 	// One-click source toggle (RealSense ↔ Unity Images)
 	QAction * _actionSourceRealSense;
