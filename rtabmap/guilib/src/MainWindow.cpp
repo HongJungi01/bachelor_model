@@ -787,8 +787,9 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 				::SemanticWorker::Mode::Http,
 				std::string(url),
 				[masksPtr](int nodeId,
-				           const std::vector<::semantic::LabeledBox> & boxes) {
-					masksPtr->setLabeledBoxes(nodeId, boxes);
+				           const std::vector<::semantic::LabeledBox> & boxes,
+				           const cv::Mat & mask) {
+					masksPtr->setLabeledBoxes(nodeId, boxes, mask);
 				}));
 			UINFO("MainWindow: semantic SLAM enabled via RTABMAP_SEMANTIC_URL=%s", url);
 		}

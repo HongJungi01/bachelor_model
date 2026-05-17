@@ -1,31 +1,39 @@
 """
-test_semantic.py — smoke-test the semantic detection pipeline.
+test_semantic.py — live visualizer for the semantic_service /detect endpoint.
 
-Sends frames to the running semantic_service (/detect endpoint) and renders
-annotated results with OpenCV. Alternatively, calls the LLM directly via
---direct mode (no FastAPI required, but needs API key in env).
+Default mode (no args) is MONITOR: passively polls /debug_image +
+/debug_json and shows whatever the service most recently processed,
+regardless of who pushed it (typically RTAB-Map GUI feeding it Unity TCP
+frames). Use this to watch live keyframes get segmented in real time
+without disturbing the pipeline.
+
+Passing an input file or --camera switches to SENDER mode, where this
+script pushes frames itself — useful as a standalone sanity check when
+RTAB-Map isn't running.
 
 Usage:
-    # image
+    # MONITOR (default) — watch what RTAB-Map is sending right now
+    python test_semantic.py
+
+    # SENDER — single image
     python test_semantic.py path/to/image.jpg
 
-    # video (sample every 30 frames by default)
+    # SENDER — video file (auto-play, every frame)
     python test_semantic.py path/to/video.mp4
 
-    # video — custom sampling interval
-    python test_semantic.py video.mp4 --interval 60
+    # SENDER — video sampled every Nth frame
+    python test_semantic.py video.mp4 --stride 2
 
-    # point at a non-default service URL
-    python test_semantic.py image.jpg --service http://127.0.0.1:7788
+    # SENDER — webcam
+    python test_semantic.py --camera 0
 
-    # skip FastAPI — call LLM directly (API key must be set in env, no SAM)
-    python test_semantic.py image.jpg --direct
+    # remote service
+    python test_semantic.py --service http://127.0.0.1:7788
 
-OpenCV window controls:
-    SPACE / RIGHT  next frame
-    LEFT           previous frame
-    s              save annotated frame to ./test_output/<original_name>_NNN.jpg
-    q / ESC        quit
+Keys (OpenCV window):
+    SPACE       pause / resume (sender mode only)
+    s           save current annotated frame to ./test_output/
+    q / ESC     quit
 """
 
 from __future__ import annotations
@@ -34,34 +42,27 @@ import argparse
 import base64
 import io
 import json
-import math
-import os
-import sys
 import time
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from collections import deque
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import cv2
 import numpy as np
 from PIL import Image
 
 
-# ---------------------------------------------------------------------------
-# Palette (BGR) — matches grid_client.py colors for consistency
-# ---------------------------------------------------------------------------
+# Catalog-aware colors. Wall-like classes (centerLine / parkingLine) get red;
+# others get distinct hues so future labels remain visible without changes.
 _LABEL_COLOR_BGR: dict[str, tuple[int, int, int]] = {
-    "parking_line":       ( 40,  40, 220),  # red
-    "lane_divider":       ( 40, 180, 220),  # orange-red
-    "pillar":             ( 40,  40, 220),  # red
-    "traffic_cone":       (  0, 140, 255),  # orange
-    "no_entry_sign":      (  0,   0, 200),  # dark red
-    "construction_sign":  (  0, 200, 255),  # yellow
-    "exit_area":          ( 60, 200,  60),  # green
-    "exit_sign":          (220, 200,  60),  # cyan-teal
-    "floor_arrow":        (220, 200,  60),  # cyan-teal
-    "one_way_marker":     (200,  60, 200),  # magenta
+    "centerLine":   ( 40,  40, 220),
+    "parkingLine":  ( 40,  40, 220),
+    "Arrow":        (220, 200,  60),
+    "rubberCone":   (  0, 140, 255),
+    "sign":         (  0, 200, 255),
+    "word":         (200,  60, 200),
 }
 _DEFAULT_COLOR_BGR = (180, 180, 180)
 
@@ -71,90 +72,17 @@ def _color(label: str) -> tuple[int, int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Annotation
-# ---------------------------------------------------------------------------
-
-def annotate(
-    bgr: np.ndarray,
-    detections: list[dict[str, Any]],
-    mask_np: np.ndarray | None,
-    infer_ms: int,
-    timing: dict[str, int] | None = None,
-) -> np.ndarray:
-    out = bgr.copy()
-
-    # Semi-transparent green mask overlay (30% green tint)
-    if mask_np is not None and mask_np.any():
-        sel = mask_np > 0
-        overlay = out.copy()
-        overlay[sel] = (overlay[sel].astype(np.uint16) * np.array([1, 3, 1], np.uint16) // 4).astype(np.uint8)
-        overlay[sel, 1] = np.maximum(overlay[sel, 1], 120)
-        cv2.addWeighted(overlay, 0.45, out, 0.55, 0, out)
-
-    h, w = out.shape[:2]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    scale = max(0.35, w / 1920.0)
-    thick = max(1, int(scale * 2))
-
-    for det in detections:
-        x1, y1, x2, y2 = (int(v) for v in det["box"])
-        label = det["label"]
-        conf = det["confidence"]
-        va = det.get("visual_angle")
-        col = _color(label)
-
-        cv2.rectangle(out, (x1, y1), (x2, y2), col, thick + 1)
-
-        txt = f"{label} {conf:.2f}"
-        if va is not None:
-            txt += f" @{va:.0f}deg"
-
-        (tw, th), _ = cv2.getTextSize(txt, font, scale, thick)
-        ty = max(y1, th + 4)
-        cv2.rectangle(out, (x1, ty - th - 4), (x1 + tw + 4, ty), col, -1)
-        cv2.putText(out, txt, (x1 + 2, ty - 2), font, scale, (255, 255, 255), thick,
-                    cv2.LINE_AA)
-
-        # Angle arrow inside the box
-        if va is not None:
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
-            length = max(10.0, min(x2 - x1, y2 - y1) * 0.38)
-            theta = math.radians(va)
-            dx = math.sin(theta) * length
-            dy = -math.cos(theta) * length
-            cv2.arrowedLine(
-                out,
-                (int(cx), int(cy)),
-                (int(cx + dx), int(cy + dy)),
-                col, thick + 1, tipLength=0.35,
-            )
-
-    # Status bar
-    if timing:
-        llm_ms = timing.get("llm_ms", 0)
-        sam_ms = timing.get("sam_ms", 0)
-        status = (f"det:{len(detections)}  "
-                  f"total:{infer_ms/1000:.1f}s  llm:{llm_ms/1000:.1f}s  sam:{sam_ms/1000:.2f}s  "
-                  f"{w}x{h}")
-    else:
-        status = f"det:{len(detections)}  total:{infer_ms/1000:.1f}s  {w}x{h}"
-    (sw, sh), _ = cv2.getTextSize(status, font, scale, thick)
-    cv2.rectangle(out, (4, 4), (sw + 12, sh + 12), (0, 0, 0), -1)
-    cv2.putText(out, status, (8, sh + 8), font, scale, (0, 240, 0), thick, cv2.LINE_AA)
-
-    return out
-
-
-# ---------------------------------------------------------------------------
-# HTTP mode (requires service running)
+# Service call
 # ---------------------------------------------------------------------------
 
 def detect_via_service(
-    pil: Image.Image,
+    bgr: np.ndarray,
     service_url: str,
-    request_id: int = 0,
+    request_id: int,
+    timeout_s: float = 5.0,
 ) -> tuple[list[dict], np.ndarray | None, int]:
+    """POST one frame to /detect. Returns (detections, mask, inference_ms)."""
+    pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     buf = io.BytesIO()
     pil.save(buf, format="JPEG", quality=90)
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -167,7 +95,7 @@ def detect_via_service(
         method="POST",
     )
     try:
-        with urlopen(req, timeout=60) as resp:
+        with urlopen(req, timeout=timeout_s) as resp:
             result = json.loads(resp.read())
     except HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -184,234 +112,373 @@ def detect_via_service(
         mask_pil = Image.open(io.BytesIO(mask_bytes)).convert("L")
         mask_np = np.array(mask_pil, dtype=np.uint8)
 
-    timing = {
-        "total_ms":  result["inference_ms"],
-        "llm_ms":    result.get("llm_ms", 0),
-        "sam_ms":    result.get("sam_ms", 0),
-    }
-    return result["detections"], mask_np, timing
+    return result["detections"], mask_np, int(result["inference_ms"])
 
 
 # ---------------------------------------------------------------------------
-# Direct mode (no FastAPI — LLM only, no SAM)
+# Rendering
 # ---------------------------------------------------------------------------
 
-def _inject_venv() -> None:
-    """Add semantic_service venv site-packages so pydantic/google-genai/etc. are importable."""
-    venv_root = Path(__file__).parent / "semantic_service" / ".venv"
-    candidates = [
-        venv_root / "Lib" / "site-packages",          # Windows
-        venv_root / "lib" / "site-packages",           # Linux fallback (no version dir)
-    ]
-    # Also search lib/python3.x/site-packages on Linux
-    lib = venv_root / "lib"
-    if lib.is_dir():
-        for sub in lib.iterdir():
-            candidates.append(sub / "site-packages")
+def annotate(
+    bgr: np.ndarray,
+    detections: list[dict[str, Any]],
+    mask_np: np.ndarray | None,
+    inference_ms: int,
+    display_fps: float,
+    request_id: int,
+    paused: bool,
+) -> np.ndarray:
+    out = bgr.copy()
+    h, w = out.shape[:2]
 
-    for sp in candidates:
-        if sp.exists() and str(sp) not in sys.path:
-            sys.path.insert(0, str(sp))
-            return
+    # Mask overlay: greenish tint where any instance was segmented.
+    if mask_np is not None and mask_np.any():
+        sel = mask_np > 0
+        overlay = out.copy()
+        overlay[sel] = (
+            overlay[sel].astype(np.uint16) * np.array([1, 3, 1], np.uint16) // 4
+        ).astype(np.uint8)
+        overlay[sel, 1] = np.maximum(overlay[sel, 1], 140)
+        cv2.addWeighted(overlay, 0.55, out, 0.45, 0, out)
 
-    print(
-        "[test_semantic] WARNING: semantic_service/.venv not found.\n"
-        "  --direct mode needs pydantic + LLM SDK in the current Python env.\n"
-        "  Option A (recommended): start the service and drop --direct\n"
-        "    > semantic_service\\run_semantic.bat   (new terminal)\n"
-        "    > python test_semantic.py <image>\n"
-        "  Option B: install deps here\n"
-        "    > pip install pydantic annotated_types pillow google-genai\n"
-        "      (replace google-genai with anthropic if LLM_PROVIDER=anthropic)"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = max(0.4, w / 1920.0)
+    thick = max(1, int(scale * 2))
+
+    for det in detections:
+        x1, y1, x2, y2 = (int(v) for v in det["box"])
+        label = det["label"]
+        conf = det["confidence"]
+        col = _color(label)
+
+        cv2.rectangle(out, (x1, y1), (x2, y2), col, thick + 1)
+
+        txt = f"{label} {conf:.2f}"
+        (tw, th), _ = cv2.getTextSize(txt, font, scale, thick)
+        ty = max(y1, th + 4)
+        cv2.rectangle(out, (x1, ty - th - 4), (x1 + tw + 4, ty), col, -1)
+        cv2.putText(out, txt, (x1 + 2, ty - 2), font, scale,
+                    (255, 255, 255), thick, cv2.LINE_AA)
+
+    # Status bar (top-left)
+    pause_tag = "  [PAUSED]" if paused else ""
+    status = (
+        f"req:{request_id}  det:{len(detections)}  "
+        f"infer:{inference_ms}ms  disp:{display_fps:.1f}fps  "
+        f"{w}x{h}{pause_tag}"
     )
+    (sw, sh), _ = cv2.getTextSize(status, font, scale, thick)
+    cv2.rectangle(out, (4, 4), (sw + 12, sh + 12), (0, 0, 0), -1)
+    cv2.putText(out, status, (8, sh + 8), font, scale,
+                (0, 240, 0), thick, cv2.LINE_AA)
 
-
-def detect_direct(pil: Image.Image) -> tuple[list[dict], None, int]:
-    _inject_venv()
-    sys.path.insert(0, str(Path(__file__).parent / "semantic_service"))
-    from llm_runner import LlmRunner  # type: ignore
-
-    runner = LlmRunner()
-    t0 = time.perf_counter()
-    result = runner.detect(pil)
-    infer_ms = int((time.perf_counter() - t0) * 1000)
-
-    detections = [
-        {
-            "box": d.box,
-            "label": d.label,
-            "confidence": d.confidence,
-            "visual_angle": d.visual_angle,
-        }
-        for d in result.detections
-    ]
-    timing = {"total_ms": infer_ms, "llm_ms": infer_ms, "sam_ms": 0}
-    return detections, None, timing
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Frame extraction
+# Monitor mode — poll /debug_image + /debug_json
 # ---------------------------------------------------------------------------
 
-def load_frames(path: Path, interval: int) -> list[tuple[Image.Image, str]]:
-    """Return (PIL image, caption) pairs from an image or video file."""
-    suffix = path.suffix.lower()
+def _http_get(url: str, timeout_s: float) -> tuple[int, bytes]:
+    req = Request(url, method="GET")
+    try:
+        with urlopen(req, timeout=timeout_s) as resp:
+            return resp.status, resp.read()
+    except HTTPError as e:
+        return e.code, e.read() if hasattr(e, "read") else b""
+    except URLError as e:
+        raise RuntimeError(f"Cannot reach {url} ({e.reason})") from e
+
+
+def run_monitor(args: argparse.Namespace) -> int:
+    """Poll /debug_image and /debug_json. Shows whatever the service most
+    recently processed — independent of who pushed it (RTAB / sender / etc)."""
+    base = args.service.rstrip("/")
+    win = f"semantic monitor - {base}  [s=save  q=quit]"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+    last_req_id: Any = object()  # sentinel: definitely != any first response
+    disp_times: deque[float] = deque(maxlen=30)
+    fresh_times: deque[float] = deque(maxlen=30)
+    prev_t = time.perf_counter()
+    last_vis: np.ndarray | None = None
+    waiting_logged = False
+    waiting_since = time.perf_counter()
+
+    while True:
+        loop_t0 = time.perf_counter()
+
+        try:
+            status_meta, body_meta = _http_get(f"{base}/debug_json",
+                                                timeout_s=args.timeout)
+            status_img, body_img = _http_get(f"{base}/debug_image",
+                                              timeout_s=args.timeout)
+        except RuntimeError as e:
+            now = time.perf_counter()
+            if now - waiting_since > 2.0:
+                print(f"[test_semantic] {e}  (is semantic_service running?)")
+                waiting_since = now
+            if cv2.waitKey(500) & 0xFF in (ord('q'), 27):
+                break
+            continue
+
+        if status_meta == 404 or status_img == 404:
+            now = time.perf_counter()
+            if not waiting_logged or now - waiting_since > 3.0:
+                print("[test_semantic] service is up but no frame processed yet "
+                      "— is RTAB-Map running and pushing keyframes?")
+                waiting_logged = True
+                waiting_since = now
+            if cv2.waitKey(200) & 0xFF in (ord('q'), 27):
+                break
+            continue
+        if status_meta != 200 or status_img != 200:
+            print(f"[test_semantic] HTTP error meta={status_meta} img={status_img}")
+            if cv2.waitKey(500) & 0xFF in (ord('q'), 27):
+                break
+            continue
+
+        meta = json.loads(body_meta)
+        np_jpeg = np.frombuffer(body_img, dtype=np.uint8)
+        bgr = cv2.imdecode(np_jpeg, cv2.IMREAD_COLOR)
+        if bgr is None:
+            print("[test_semantic] failed to decode debug_image JPEG")
+            continue
+
+        req_id = meta.get("request_id")
+        is_fresh = req_id != last_req_id
+        if is_fresh:
+            fresh_times.append(loop_t0)
+            last_req_id = req_id
+
+        now = time.perf_counter()
+        disp_times.append(now - prev_t)
+        prev_t = now
+        disp_fps = (len(disp_times) / sum(disp_times)) if disp_times else 0.0
+        # Service-side processing rate = how often req_id changes
+        if len(fresh_times) >= 2:
+            svc_fps = (len(fresh_times) - 1) / (fresh_times[-1] - fresh_times[0])
+        else:
+            svc_fps = 0.0
+
+        h, w = bgr.shape[:2]
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = max(0.4, w / 1920.0)
+        thick = max(1, int(scale * 2))
+        n_det = len(meta.get("detections", []))
+        infer_ms = int(meta.get("inference_ms", 0))
+        bar = (
+            f"MONITOR  req:{req_id}  det:{n_det}  "
+            f"infer:{infer_ms}ms  svc:{svc_fps:.1f}fps  "
+            f"poll:{disp_fps:.1f}fps  {w}x{h}"
+        )
+        (sw, sh), _ = cv2.getTextSize(bar, font, scale, thick)
+        # Service-side already drew its own status; put ours below to avoid overlap.
+        y_top = 24
+        cv2.rectangle(bgr, (4, y_top), (sw + 12, y_top + sh + 8), (0, 0, 0), -1)
+        cv2.putText(bgr, bar, (8, y_top + sh + 4),
+                    font, scale, (255, 220, 80), thick, cv2.LINE_AA)
+
+        last_vis = bgr
+        cv2.imshow(win, bgr)
+
+        # Throttle to args.poll_hz so we don't spam the service.
+        target_dt = 1.0 / max(1.0, args.poll_hz)
+        elapsed = time.perf_counter() - loop_t0
+        wait_ms = max(1, int((target_dt - elapsed) * 1000))
+        key = cv2.waitKey(wait_ms) & 0xFF
+        if key in (ord('q'), 27):
+            break
+        if key == ord('s') and last_vis is not None:
+            _save(last_vis, args.save_dir, "monitor", req_id if isinstance(req_id, int) else 0)
+
+    cv2.destroyAllWindows()
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Capture sources
+# ---------------------------------------------------------------------------
+
+def open_capture(args: argparse.Namespace) -> tuple[cv2.VideoCapture | None, str]:
+    """Return (cap, caption_prefix). cap is None for single-image mode."""
+    if args.camera is not None:
+        cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open camera index {args.camera}")
+        # Try to coax 720p.
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        return cap, f"camera{args.camera}"
+
+    path = Path(args.input)
+    if not path.exists():
+        raise RuntimeError(f"file not found: {path}")
+
     image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
+    if path.suffix.lower() in image_exts:
+        return None, path.name
 
-    if suffix in image_exts:
-        pil = Image.open(path).convert("RGB")
-        return [(pil, path.name)]
-
-    # Video
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
-        raise ValueError(f"Cannot open video: {path}")
-
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames: list[tuple[Image.Image, str]] = []
-
-    idx = 0
-    while True:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ok, bgr = cap.read()
-        if not ok:
-            break
-        pil = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        ts = idx / fps
-        caption = f"{path.name}  frame {idx}  ({ts:.1f}s)"
-        frames.append((pil, caption))
-        idx += interval
-        if idx >= total:
-            break
-
-    cap.release()
-    print(f"[test_semantic] extracted {len(frames)} frames "
-          f"(every {interval} frames, total {total})")
-    return frames
+        raise RuntimeError(f"cannot open video: {path}")
+    return cap, path.name
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        description="Test semantic detection on an image or video."
-    )
-    ap.add_argument("input", help="Path to image or video file")
-    ap.add_argument(
-        "--service", default="http://127.0.0.1:7788",
-        help="Semantic service base URL (default: http://127.0.0.1:7788)"
-    )
-    ap.add_argument(
-        "--direct", action="store_true",
-        help="Call LLM directly via llm_runner.py (no service, no SAM)"
-    )
-    ap.add_argument(
-        "--interval", type=int, default=30,
-        help="Frame sampling interval for video (default: 30)"
-    )
-    ap.add_argument(
-        "--save-dir", default="test_output",
-        help="Directory to save annotated images (default: test_output)"
-    )
-    args = ap.parse_args()
-
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"[test_semantic] ERROR: file not found: {input_path}")
+def run_single_image(args: argparse.Namespace, caption: str) -> int:
+    bgr = cv2.imread(args.input)
+    if bgr is None:
+        print(f"[test_semantic] failed to read {args.input}")
         return 1
 
-    print(f"[test_semantic] loading frames from {input_path} ...")
-    frames = load_frames(input_path, args.interval)
-    if not frames:
-        print("[test_semantic] no frames extracted")
+    print(f"[test_semantic] sending {caption} ({bgr.shape[1]}x{bgr.shape[0]}) ...")
+    try:
+        dets, mask, ms = detect_via_service(bgr, args.service, request_id=0)
+    except Exception as e:
+        print(f"[test_semantic] FAILED: {e}")
         return 1
 
-    save_dir = Path(args.save_dir)
-    annotated_frames: list[np.ndarray] = []
-    results_log: list[dict] = []
+    print(f"  inference_ms={ms}  detections={len(dets)}")
+    for d in dets:
+        print(f"    {d['label']:14s}  conf={d['confidence']:.2f}  "
+              f"box={[int(v) for v in d['box']]}")
 
-    print(f"[test_semantic] processing {len(frames)} frame(s) ...")
-    for i, (pil, caption) in enumerate(frames):
-        print(f"  [{i+1}/{len(frames)}] {caption} ...", end=" ", flush=True)
-        try:
-            if args.direct:
-                detections, mask_np, timing = detect_direct(pil)
-            else:
-                detections, mask_np, timing = detect_via_service(
-                    pil, args.service, request_id=i
-                )
-        except Exception as e:
-            print(f"FAILED ({e})")
-            if not args.direct:
-                print("  -> Is the service running? Try: semantic_service\\run_semantic.bat")
-            continue
-
-        total_ms = timing["total_ms"]
-        llm_ms   = timing["llm_ms"]
-        sam_ms   = timing["sam_ms"]
-        other_ms = max(0, total_ms - llm_ms - sam_ms)
-        print(
-            f"total={total_ms}ms  "
-            f"[llm={llm_ms}ms  sam={sam_ms}ms  other={other_ms}ms]  "
-            f"{len(detections)} detection(s)"
-        )
-        for det in detections:
-            va = det.get("visual_angle")
-            angle_str = f"  visual_angle={va:.1f}°" if va is not None else ""
-            print(f"      {det['label']:20s}  conf={det['confidence']:.2f}"
-                  f"  box={[int(v) for v in det['box']]}{angle_str}")
-
-        results_log.append({
-            "frame": i,
-            "caption": caption,
-            "timing": timing,
-            "detections": detections,
-        })
-
-        bgr = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-        vis = annotate(bgr, detections, mask_np, total_ms, timing)
-        cv2.putText(vis, caption, (8, vis.shape[0] - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1, cv2.LINE_AA)
-        annotated_frames.append(vis)
-
-    if not annotated_frames:
-        print("[test_semantic] no successful results")
-        return 1
-
-    # Save JSON summary
-    summary_path = Path(f"test_output_{input_path.stem}.json")
-    summary_path.write_text(json.dumps(results_log, indent=2, ensure_ascii=False),
-                            encoding="utf-8")
-    print(f"\n[test_semantic] JSON summary → {summary_path}")
-
-    # Interactive OpenCV viewer
-    win = f"semantic test — {input_path.name}  [SPACE=next  LEFT=prev  s=save  q=quit]"
+    vis = annotate(bgr, dets, mask, ms, 0.0, 0, paused=False)
+    win = f"semantic test - {caption}  [s=save  q=quit]"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    idx = 0
+    cv2.imshow(win, vis)
     while True:
-        img = annotated_frames[idx]
-        cv2.imshow(win, img)
         key = cv2.waitKey(0) & 0xFF
-
         if key in (ord('q'), 27):
             break
-        elif key in (ord(' '), 83, 3):   # SPACE, right arrow
-            idx = min(idx + 1, len(annotated_frames) - 1)
-        elif key in (81, 2):              # left arrow
-            idx = max(idx - 1, 0)
-        elif key == ord('s'):
-            save_dir.mkdir(parents=True, exist_ok=True)
-            stem = input_path.stem
-            out_path = save_dir / f"{stem}_{idx:04d}.jpg"
-            cv2.imwrite(str(out_path), img)
-            print(f"[test_semantic] saved → {out_path}")
-
+        if key == ord('s'):
+            _save(vis, args.save_dir, caption, 0)
     cv2.destroyAllWindows()
     return 0
 
 
+def run_stream(
+    cap: cv2.VideoCapture,
+    args: argparse.Namespace,
+    caption_prefix: str,
+) -> int:
+    is_camera = args.camera is not None
+    win = f"semantic test - {caption_prefix}  [SPACE=pause  s=save  q=quit]"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+
+    paused = False
+    request_id = 0
+    last_vis: np.ndarray | None = None
+    last_frame: tuple[np.ndarray, list[dict], np.ndarray | None, int] | None = None
+    disp_times: deque[float] = deque(maxlen=30)
+    prev_t = time.perf_counter()
+    last_fail_print = 0.0
+
+    while True:
+        if not paused:
+            for _ in range(max(1, args.stride)):
+                ok, bgr = cap.read()
+                if not ok:
+                    break
+            if not ok:
+                if is_camera:
+                    print("[test_semantic] camera read failed; exiting")
+                    break
+                print("[test_semantic] end of video")
+                break
+
+            try:
+                dets, mask, ms = detect_via_service(
+                    bgr, args.service, request_id=request_id,
+                    timeout_s=args.timeout,
+                )
+            except Exception as e:
+                now = time.perf_counter()
+                if now - last_fail_print > 2.0:
+                    print(f"[test_semantic] /detect failed: {e}")
+                    last_fail_print = now
+                # Show raw frame so the stream doesn't freeze visually.
+                dets, mask, ms = [], None, 0
+
+            last_frame = (bgr, dets, mask, ms)
+            request_id += 1
+
+        if last_frame is None:
+            # Camera produced nothing yet — wait briefly and retry.
+            if cv2.waitKey(10) & 0xFF in (ord('q'), 27):
+                break
+            continue
+
+        now = time.perf_counter()
+        disp_times.append(now - prev_t)
+        prev_t = now
+        disp_fps = (len(disp_times) / sum(disp_times)) if disp_times else 0.0
+
+        bgr, dets, mask, ms = last_frame
+        vis = annotate(bgr, dets, mask, ms, disp_fps, request_id - 1, paused)
+        last_vis = vis
+        cv2.imshow(win, vis)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (ord('q'), 27):
+            break
+        if key == ord(' '):
+            paused = not paused
+            print(f"[test_semantic] {'paused' if paused else 'resumed'}")
+        elif key == ord('s') and last_vis is not None:
+            _save(last_vis, args.save_dir, caption_prefix, request_id - 1)
+
+    cap.release()
+    cv2.destroyAllWindows()
+    return 0
+
+
+def _save(vis: np.ndarray, save_dir: str, caption: str, idx: int) -> None:
+    out_dir = Path(save_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(caption).stem or caption
+    out_path = out_dir / f"{stem}_{idx:05d}.jpg"
+    cv2.imwrite(str(out_path), vis)
+    print(f"[test_semantic] saved -> {out_path}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Live visualizer for the semantic_service /detect endpoint."
+    )
+    ap.add_argument("input", nargs="?", help="image or video file path (switches to sender mode)")
+    ap.add_argument("--camera", type=int, default=None,
+                    help="webcam index (switches to sender mode, e.g. --camera 0)")
+    ap.add_argument("--poll-hz", type=float, default=20.0,
+                    help="monitor mode polling rate (default: 20)")
+    ap.add_argument("--service", default="http://127.0.0.1:7788",
+                    help="semantic_service base URL")
+    ap.add_argument("--stride", type=int, default=1,
+                    help="advance the capture by N frames per inference (1 = every frame)")
+    ap.add_argument("--timeout", type=float, default=5.0,
+                    help="per-request timeout seconds")
+    ap.add_argument("--save-dir", default="test_output",
+                    help="directory for saved frames (s key)")
+    args = ap.parse_args()
+
+    if args.camera is None and not args.input:
+        return run_monitor(args)
+
+    try:
+        cap, caption_prefix = open_capture(args)
+    except Exception as e:
+        print(f"[test_semantic] {e}")
+        return 1
+
+    if cap is None:
+        return run_single_image(args, caption_prefix)
+    return run_stream(cap, args, caption_prefix)
+
+
 if __name__ == "__main__":
+    import sys
     sys.exit(main())

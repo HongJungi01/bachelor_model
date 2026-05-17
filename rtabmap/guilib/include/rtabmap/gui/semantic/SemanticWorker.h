@@ -1,22 +1,19 @@
 /*
  * SemanticWorker.h
  *
- * Background worker that consumes (nodeId, rgb) frames at a low rate,
- * runs the single-call LLM pipeline, and posts per-box LabeledBox
- * results back through a callback. The submit() interface is latest-only:
- * prior pending frames are dropped, which keeps the SLAM thread non-
- * blocking and trades freshness for throughput.
+ * Background worker that consumes (nodeId, rgb) frames, runs the YOLO
+ * pipeline, and posts per-box LabeledBox results back through a callback.
+ * The submit() interface is latest-only: prior pending frames are dropped,
+ * which keeps the SLAM thread non-blocking and trades freshness for
+ * throughput.
  *
  * Pipeline (one network round-trip per keyframe):
- *   /detect  — Python sidecar calls a single LLM (Gemini 3 Flash by
- *              default; Claude Sonnet 4.6 alternative) which returns
- *              boxes + labels + confidences + visual_angle in one shot.
- *              SAM refines the boxes into a union mask before responding.
+ *   /detect  — Python sidecar runs YOLO11-seg in a single forward pass
+ *              and returns boxes + labels + confidences + union mask
+ *              (~10-50 ms on an RTX 4090 at 720p).
  *
- * Because each /detect call goes through the LLM (~1-3 s), we rely on
- * the latest-only submit() semantics for natural rate limiting: while a
- * call is in flight, intermediate keyframes simply overwrite slot_ and
- * are dropped. The most recent unprocessed frame is the next one taken.
+ * Latest-only submit() still provides natural rate limiting: while a call
+ * is in flight, intermediate keyframes overwrite slot_ and are dropped.
  */
 
 #ifndef SEMANTICWORKER_H_
@@ -56,8 +53,11 @@ public:
     enum class Mode { Mock, Http };
 
     using LabeledBox     = ::semantic::LabeledBox;
+    // `mask` is CV_8UC1 (0 = background, >0 = wall pixel). May be empty —
+    // callers fall back to box raster when it is.
     using ResultCallback = std::function<void(int nodeId,
-                                               const std::vector<LabeledBox> & boxes)>;
+                                               const std::vector<LabeledBox> & boxes,
+                                               const cv::Mat & mask)>;
 
     struct Frame {
         int     nodeId = -1;
@@ -132,14 +132,15 @@ private:
             }
 
             std::vector<LabeledBox> labeled;
-            if (httpDetect(frame, labeled))
+            cv::Mat mask;
+            if (httpDetect(frame, labeled, mask))
             {
-                if (callback_) callback_(frame.nodeId, labeled);
+                if (callback_) callback_(frame.nodeId, labeled, mask);
             }
             else
             {
                 // Dispatch empty so MaskStore entries don't sit pending forever.
-                if (callback_) callback_(frame.nodeId, {});
+                if (callback_) callback_(frame.nodeId, {}, cv::Mat());
             }
         }
     }
@@ -154,18 +155,21 @@ private:
         lb.y1 = frame.rgb.rows * 0.65f;
         lb.x2 = frame.rgb.cols * 0.75f;
         lb.y2 = frame.rgb.rows * 0.85f;
-        lb.label      = "pillar";
+        lb.label      = "centerLine";
         lb.confidence = 1.0f;
-        callback_(frame.nodeId, {lb});
+        callback_(frame.nodeId, {lb}, cv::Mat());
     }
 
     // ---- /detect ---------------------------------------------------------
 
-    // Calls /detect once. The Python sidecar runs the LLM (and SAM mask
-    // refinement) and returns boxes + labels + confidences + visual_angle
-    // in a single response. Returns false on transport / parse error;
-    // returns true with an empty `out` when the LLM saw nothing of interest.
-    bool httpDetect(const Frame & frame, std::vector<LabeledBox> & out)
+    // Calls /detect once. The Python sidecar runs YOLO11-seg and returns
+    // boxes + labels + confidences + union mask in a single response.
+    // Returns false on transport / parse error; returns true with an empty
+    // `out` when YOLO found nothing of interest. `outMask` is filled with the
+    // decoded binary union mask (CV_8UC1, 0/255) when present, or left empty.
+    bool httpDetect(const Frame & frame,
+                    std::vector<LabeledBox> & out,
+                    cv::Mat & outMask)
     {
         if (!ensureClient()) return false;
 
@@ -220,9 +224,27 @@ private:
                     out.push_back(std::move(lb));
                 }
             }
+            if (j.contains("mask_png_b64") && j["mask_png_b64"].is_string())
+            {
+                const std::string & b64 = j["mask_png_b64"].get_ref<const std::string &>();
+                if (!b64.empty())
+                {
+                    std::vector<uint8_t> png = base64Decode(b64);
+                    if (!png.empty())
+                    {
+                        outMask = cv::imdecode(cv::Mat(png), cv::IMREAD_GRAYSCALE);
+                        if (outMask.empty())
+                            UWARN("SemanticWorker: mask_png_b64 imdecode failed");
+                    }
+                }
+            }
             const int infMs = j.value("inference_ms", -1);
-            UDEBUG("SemanticWorker: /detect node=%d boxes=%zu inference_ms=%d",
-                   frame.nodeId, out.size(), infMs);
+            std::string lbls;
+            for (size_t i = 0; i < out.size(); ++i)
+                lbls += (i ? "," : "") + out[i].label;
+            UINFO("SemanticWorker: /detect node=%d det=%zu [%s] mask=%dx%d infer=%dms",
+                  frame.nodeId, out.size(), lbls.c_str(),
+                  outMask.cols, outMask.rows, infMs);
         }
         catch (const std::exception & e)
         {
@@ -250,9 +272,8 @@ private:
         client_ = std::make_unique<httplib::Client>(host_, port_);
         client_->set_keep_alive(true);
         client_->set_connection_timeout(5, 0);
-        // /detect now goes through the LLM + SAM, so it can take several
-        // seconds. Keep this generous.
-        client_->set_read_timeout(30, 0);
+        // YOLO inference is ~10-50 ms; 5 s is a generous cushion.
+        client_->set_read_timeout(5, 0);
         client_->set_write_timeout(5, 0);
         UINFO("SemanticWorker: HTTP client ready -> %s:%d (path %s)",
               host_.c_str(), port_, detectPath_.c_str());
@@ -287,6 +308,38 @@ private:
     }
 
     // ---- base64 ---------------------------------------------------------
+
+    static std::vector<uint8_t> base64Decode(const std::string & in)
+    {
+        static int8_t T[256];
+        static bool inited = false;
+        if (!inited)
+        {
+            for (int i = 0; i < 256; i++) T[i] = -1;
+            static const char tbl[] =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            for (int i = 0; i < 64; i++) T[(uint8_t)tbl[i]] = static_cast<int8_t>(i);
+            inited = true;
+        }
+        std::vector<uint8_t> out;
+        out.reserve((in.size() * 3) / 4);
+        uint32_t val = 0;
+        int bits = 0;
+        for (char c : in)
+        {
+            if (c == '=') break;
+            const int8_t d = T[(uint8_t)c];
+            if (d < 0) continue;   // skip whitespace / invalid
+            val = (val << 6) | static_cast<uint32_t>(d);
+            bits += 6;
+            if (bits >= 8)
+            {
+                bits -= 8;
+                out.push_back(static_cast<uint8_t>((val >> bits) & 0xFF));
+            }
+        }
+        return out;
+    }
 
     static std::string base64Encode(const uint8_t * data, size_t len)
     {

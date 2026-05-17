@@ -68,6 +68,17 @@ semanticplan.md
 grid.png
 semantic_service/.venv/
 semantic_service/__pycache__/
+semantic_service/models/*
+!semantic_service/models/.gitkeep
+!semantic_service/models/best.pt
+semantic_service/runs/
+simulationyolo.yolov11/
+simulationyolo.yolov11.zip
+# Ultralytics base weights auto-downloaded during training (not our artifact)
+yolo11*.pt
+yolo26*.pt
+# Stray model copies outside semantic_service/models/
+/best.pt
 
 # === Test inputs / outputs (local only) ===
 KakaoTalk_*.jpg

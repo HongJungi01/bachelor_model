@@ -2,31 +2,27 @@
 grid_client.py - Live visualizer for the RTABMap GUI's TCP grid stream.
 
 Connects to 127.0.0.1:7777 and renders the occupancy grid + robot pose
-in real time. Semantic-tagged cells are drawn in distinct colors so you
-can see LLM detections (parking lines, exit areas, direction signs)
-layered on top of the structural map.
+in real time. Semantic-tagged cells are drawn so YOLO-detected
+centerLine / parkingLine surfaces appear layered on the structural map.
 
-Cell value legend (matches SemanticMaskStore.h / prompt.md):
+Cell value legend (matches SemanticMaskStore.h):
     -1     unknown          -> gray   (128, 128, 128)
      0     free             -> white  (255, 255, 255)
      1     wall-like        -> red    BGR ( 40,  40, 220)
-                               pillar / parking_line / traffic_cone /
-                               no_entry_sign / construction_sign
-    10     destination      -> green  BGR ( 60, 200,  60)
-                               exit_area
-    11..18 dest direction   -> cyan   BGR (220, 200,  60)
-                               exit_sign / floor_arrow (10 + worldDirBin)
-    21..28 one-way zone     -> magenta BGR (200,  60, 200)
-                               one_way_marker (20 + worldDirBin)
+                               centerLine / parkingLine
    100     obstacle (RTABMap structural) -> black (  0,   0,   0)
 
 Usage:
     pip install opencv-python numpy
-    python grid_client.py          (q or ESC to quit)
+    python grid_client.py                 # default: 2 px per cell
+    python grid_client.py --scale 4       # zoom in
+    python grid_client.py --scale 1       # shrink (large maps)
+    (q or ESC to quit)
 """
 
 from __future__ import annotations
 
+import argparse
 import math
 import socket
 import struct
@@ -80,14 +76,6 @@ def grid_to_bgr(grid: np.ndarray) -> np.ndarray:
     bgr = np.full((*grid.shape, 3), 128, dtype=np.uint8)  # unknown = gray
     bgr[grid == 0]   = (255, 255, 255)   # free
     bgr[grid == 1]   = ( 40,  40, 220)   # wall-like semantic (red in BGR)
-    bgr[grid == 10]  = ( 60, 200,  60)   # destination / exit_area (green)
-    # Direction-coded cells: bins 1..8 collapse to one color per family.
-    # The bin (low nibble) is preserved in the int8 grid for downstream
-    # path planners — only the visualization is flattened.
-    dest_dir = (grid >= 11) & (grid <= 18)
-    one_way  = (grid >= 21) & (grid <= 28)
-    bgr[dest_dir]    = (220, 200,  60)   # cyan-teal (BGR)
-    bgr[one_way]     = (200,  60, 200)   # magenta (BGR)
     bgr[grid == 100] = (  0,   0,   0)   # obstacle
     return bgr
 
@@ -100,15 +88,18 @@ def world_to_px(wx: float, wy: float, f: GridFrame) -> tuple[int, int]:
 
 
 def draw_overlay(img: np.ndarray, f: GridFrame, n_sem: int, n_obs: int,
-                 frame_count: int) -> None:
+                 frame_count: int, scale: int) -> None:
     arrow_m = 0.8  # arrow length in metres
     tip_x = f.pose_x + arrow_m * math.cos(f.pose_yaw)
     tip_y = f.pose_y + arrow_m * math.sin(f.pose_yaw)
-    base_px = world_to_px(f.pose_x, f.pose_y, f)
-    tip_px  = world_to_px(tip_x,    tip_y,    f)
+    bx, by = world_to_px(f.pose_x, f.pose_y, f)
+    tx, ty = world_to_px(tip_x,    tip_y,    f)
+    base_px = (bx * scale, by * scale)
+    tip_px  = (tx * scale, ty * scale)
 
-    cv2.circle(img, base_px, 5, (0, 0, 255), -1)
-    cv2.arrowedLine(img, base_px, tip_px, (0, 0, 255), 2, tipLength=0.4)
+    cv2.circle(img, base_px, max(3, 2 * scale), (0, 0, 255), -1)
+    cv2.arrowedLine(img, base_px, tip_px, (0, 0, 255),
+                    max(2, scale), tipLength=0.4)
 
     lines = [
         f"frame {frame_count}",
@@ -128,19 +119,31 @@ def draw_overlay(img: np.ndarray, f: GridFrame, n_sem: int, n_obs: int,
 
 
 def main() -> int:
-    print(f"[grid_client] connecting to {HOST}:{PORT} ...")
+    ap = argparse.ArgumentParser(description="Live RTABMap occupancy grid viewer")
+    ap.add_argument("--scale", type=int, default=2,
+                    help="screen pixels per grid cell (default: 2). "
+                         "Keeps zoom constant as the map grows.")
+    ap.add_argument("--host", default=HOST)
+    ap.add_argument("--port", type=int, default=PORT)
+    args = ap.parse_args()
+    if args.scale < 1:
+        args.scale = 1
+
+    print(f"[grid_client] connecting to {args.host}:{args.port} ...")
     while True:
         try:
-            sock = socket.create_connection((HOST, PORT), timeout=5.0)
+            sock = socket.create_connection((args.host, args.port), timeout=5.0)
             break
         except (ConnectionRefusedError, OSError) as e:
             print(f"[grid_client]   waiting for server ({e}); retry in 1s")
             time.sleep(1.0)
 
     sock.settimeout(None)
-    print("[grid_client] connected  --  press q or ESC to quit")
+    print(f"[grid_client] connected  -- scale={args.scale}px/cell -- press q or ESC to quit")
 
-    cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+    # AUTOSIZE: window snaps to the rendered image size each frame, so
+    # cells stay scale×scale pixels regardless of how the map grows.
+    cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
 
     frame_count = 0
     n_sem = n_obs = 0
@@ -152,13 +155,15 @@ def main() -> int:
             frame_count += 1
 
             img = grid_to_bgr(np.flipud(f.grid))
-            n_sem = int(np.count_nonzero(
-                (f.grid == 1) | (f.grid == 10)
-                | ((f.grid >= 11) & (f.grid <= 18))
-                | ((f.grid >= 21) & (f.grid <= 28))
-            ))
+            if args.scale > 1:
+                img = cv2.resize(
+                    img,
+                    (img.shape[1] * args.scale, img.shape[0] * args.scale),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+            n_sem = int(np.count_nonzero(f.grid == 1))
             n_obs = int(np.count_nonzero(f.grid == 100))
-            draw_overlay(img, f, n_sem, n_obs, frame_count)
+            draw_overlay(img, f, n_sem, n_obs, frame_count, args.scale)
 
             cv2.imshow(WIN, img)
             key = cv2.waitKey(1) & 0xFF

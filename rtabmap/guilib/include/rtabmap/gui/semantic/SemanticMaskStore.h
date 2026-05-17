@@ -7,28 +7,22 @@
  * pose-independent — it operates in camera space and depends only on the
  * depth image and intrinsics.  It is therefore done ONCE when the labeled
  * boxes arrive (setLabeledBoxes) and the resulting camera-frame 3-D points
- * are stored, each tagged with the grid code derived from its Gemini label.
+ * are stored, each tagged with the grid code derived from its YOLO label.
+ *
+ * When the sidecar returns a per-frame union mask alongside boxes, the
+ * mask defines the wall pixels exactly (sharp). Box-only rasterisation is
+ * kept as a fallback for mock mode and parse failures, but produces fat
+ * axis-aligned rectangles that overshoot thin diagonal features like
+ * parking lines — use the mask path whenever possible.
  *
  * applyTo() then only needs to apply the current corrected pose transform
  * (a cheap affine multiply) to project those points onto the map grid.
  * Loop-closure pose corrections flow through automatically because poses
  * are looked up fresh on every applyTo() call.
  *
- * Grid codes (semantic overlay on int8 occupancy grid; matches prompt.md):
- *   1      wall-like        pillar, traffic_cone, parking_line,
- *                           no_entry_sign, construction_sign
- *   10     destination      exit_area
- *   11..18 dest direction   exit_sign, floor_arrow (10 + worldDirBin)
- *   21..28 one-way zone     one_way_marker (20 + worldDirBin)
- *   0      skip              lane_divider, intersection, anything else
- *
- * Direction bins (from semantic::imageAngleToWorldDirBin):
- *   bin 1 = +Y world (north),  bin 3 = +X (east),
- *   bin 5 = -Y (south),        bin 7 = -X (west); CW from north.
- *
- * Direction codes are baked at setLabeledBoxes() time using the keyframe's
- * registration pose. Subsequent loop-closure rotations do NOT re-quantize
- * already-stored bins — acceptable while quantization is 45° coarse.
+ * Grid codes (semantic overlay on int8 occupancy grid):
+ *   1      wall-like        centerLine, parkingLine
+ *   0      skip             Arrow, rubberCone, sign, word, anything else
  */
 
 #ifndef SEMANTICMASKSTORE_H_
@@ -86,21 +80,31 @@ public:
         e.camCodes.clear();
     }
 
-    // Called by SemanticWorker when /classify_batch labels arrive for nodeId.
-    // Rasterises the boxes into a label map, performs the ray-cast, and stores
-    // (camera-frame point, grid code) pairs. Releases pending depth + camera
-    // model. Boxes whose label maps to grid code 0 are silently skipped.
+    // Called by SemanticWorker when /detect labels arrive for nodeId.
+    //
+    // If `mask` is non-empty (YOLO-seg returned a pixel union), the mask
+    // defines the wall pixels directly — every non-zero pixel becomes code 1
+    // (works because all current dataset classes resolve to wall; extend if
+    // non-wall classes are ever added).
+    // If `mask` is empty (mock mode, parse failure, no detections), falls
+    // back to the legacy box raster path so the pipeline still produces
+    // SOMETHING ray-castable.
     void setLabeledBoxes(int nodeId,
-                         const std::vector<semantic::LabeledBox> & boxes)
+                         const std::vector<semantic::LabeledBox> & boxes,
+                         const cv::Mat & mask = cv::Mat())
     {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = entries_.find(nodeId);
-        if (it == entries_.end()) return;
+        if (it == entries_.end())
+        {
+            UWARN("MaskStore[%d]: no entry — registerKeyframe missed?", nodeId);
+            return;
+        }
         Entry & e = it->second;
 
         if (e.pendingCM.fx() <= 0.0f)
         {
-            // Camera model never registered (or already consumed) — bail.
+            UWARN("MaskStore[%d]: pendingCM not set — bailing", nodeId);
             return;
         }
 
@@ -113,15 +117,45 @@ public:
             return;
         }
 
-        // World-frame yaw at registration; used to quantize directional
-        // labels' image-plane visualAngle into world-frame direction bins.
-        const float robotYaw = e.pendingPose.theta();
-
         cv::Mat labeled = cv::Mat::zeros(H, W, CV_8UC1);
         int rasterised = 0;
+
+        // Decide which detections have a wall-eligible label — used to gate
+        // the mask path (no point rastering a mask when nothing in it is a
+        // wall class).
+        bool anyWall = false;
         for (const auto & lb : boxes)
         {
-            const int8_t code = resolveGridCode(lb, robotYaw);
+            if (resolveGridCode(lb) == 1) { anyWall = true; break; }
+        }
+
+        if (!mask.empty() && anyWall && mask.type() == CV_8UC1)
+        {
+            cv::Mat src;
+            if (mask.cols == W && mask.rows == H)
+                src = mask;
+            else
+                cv::resize(mask, src, cv::Size(W, H), 0, 0, cv::INTER_NEAREST);
+
+            // Thicken thin lines (parkingLine masks are often 1-2 px wide)
+            // so the step=2 back-projection in buildCamPoints catches them.
+            // Default 3x3 kernel, 1 iteration → 1 px line becomes ~3 px.
+            cv::dilate(src, src, cv::Mat());
+
+            for (int v = 0; v < H; ++v)
+            {
+                const uchar * srow = src.ptr<uchar>(v);
+                uchar * drow = labeled.ptr<uchar>(v);
+                for (int u = 0; u < W; ++u)
+                {
+                    if (srow[u] > 0) drow[u] = 1;
+                }
+            }
+            rasterised = 1;  // sentinel — "we have something to back-project"
+        }
+        else for (const auto & lb : boxes)
+        {
+            const int8_t code = resolveGridCode(lb);
             if (code == 0) continue;
             const int prio = priorityOf(code);
 
@@ -143,6 +177,7 @@ public:
             ++rasterised;
         }
 
+        const bool depthEmpty = e.pendingDepth.empty();
         if (rasterised > 0)
         {
             const rtabmap::Transform T_cam2map = e.pendingPose * e.localTransform;
@@ -150,6 +185,13 @@ public:
                            e.zFloor, T_cam2map,
                            e.camPoints, e.camCodes);
         }
+
+        UINFO("MaskStore[%d]: boxes=%zu anyWall=%d maskPath=%d "
+              "litPx=%d depthEmpty=%d camPoints=%zu zFloor=%.2f",
+              nodeId, boxes.size(), (int)anyWall,
+              (int)(!mask.empty() && anyWall && mask.type() == CV_8UC1),
+              cv::countNonZero(labeled), (int)depthEmpty,
+              e.camPoints.size(), e.zFloor);
 
         // Release bulky data — mask store no longer needs it for this entry.
         e.pendingDepth = cv::Mat();
@@ -219,47 +261,20 @@ public:
     }
 
 private:
-    // LLM label + robot yaw -> int8 grid code (prompt.md catalog).
-    // Returning 0 means "do not write". Directional labels require a
-    // valid lb.visualAngle; otherwise they are skipped.
-    static int8_t resolveGridCode(const semantic::LabeledBox & lb,
-                                  float robotYawRad)
+    // YOLO label -> int8 grid code. Returning 0 means "do not write".
+    static int8_t resolveGridCode(const semantic::LabeledBox & lb)
     {
         const std::string & l = lb.label;
-        if (l == "pillar"            ||
-            l == "traffic_cone"      ||
-            l == "parking_line"      ||
-            l == "no_entry_sign"     ||
-            l == "construction_sign")  return 1;
-        if (l == "exit_area")          return 10;
-
-        if (lb.visualAngle < 0.0f) return 0;  // direction labels need angle
-
-        if (l == "exit_sign" || l == "floor_arrow")
-        {
-            const int bin = semantic::imageAngleToWorldDirBin(
-                lb.visualAngle, robotYawRad);
-            return static_cast<int8_t>(10 + bin);   // 11..18
-        }
-        if (l == "one_way_marker")
-        {
-            const int bin = semantic::imageAngleToWorldDirBin(
-                lb.visualAngle, robotYawRad);
-            return static_cast<int8_t>(20 + bin);   // 21..28
-        }
-        // lane_divider, intersection, unknown -> skip.
+        if (l == "centerLine" || l == "parkingLine") return 1;
         return 0;
     }
 
-    // Priority for rasterisation overlap: higher overrides lower. Values
-    // outside the semantic set (e.g. RTABMap's -1 unknown, 0 free, 100
-    // occupied) read as priority 0 so wall codes still win over them.
+    // Priority for rasterisation overlap: higher overrides lower. Only the
+    // wall code is in use; RTABMap's -1 unknown / 0 free / 100 occupied
+    // read as priority 0 so wall still wins.
     static int priorityOf(int8_t code)
     {
-        if (code == 1)                         return 100;  // wall-like
-        if (code >= 21 && code <= 28)          return  60;  // one-way rule
-        if (code >= 11 && code <= 18)          return  55;  // dest direction
-        if (code == 10)                        return  50;  // exit area
+        if (code == 1) return 100;  // wall-like
         return 0;
     }
 
@@ -291,8 +306,20 @@ private:
         outPts.reserve(512);
         outCodes.reserve(512);
 
-        const int step = 2;
-
+        // entries_ accumulates one Entry per keyframe forever (camera-frame
+        // points are kept so loop-closure can move them via applyTo). To
+        // bound RAM over long sessions, cap raster sample count per entry —
+        // base step=2 for normal keyframes, escalate proportionally if the
+        // raster covers more than kMaxPointsPerEntry pixels.
+        int step = 2;
+        const int totalLit = cv::countNonZero(labeledMask);
+        if (totalLit > kMaxPointsPerEntry)
+        {
+            const float ratio = std::sqrt(
+                static_cast<float>(totalLit) /
+                static_cast<float>(kMaxPointsPerEntry));
+            step = std::max(2, static_cast<int>(std::ceil(ratio)));
+        }
         for (int v = 0; v < labeledMask.rows; v += step)
         {
             const uchar * row = labeledMask.ptr<uchar>(v);
@@ -344,6 +371,12 @@ private:
             }
         }
     }
+
+    // Per-entry raster sample budget. Each kept pixel becomes one cv::Point3f
+    // (12B) + int8_t code (1B) = 13B, plus vector overhead. At 4096 →
+    // ~53 KB/entry → ~270 MB for 5k keyframes (~1 hr SLAM at 1.4 Hz keyframe
+    // rate). Bumping this trades RAM for finer semantic detail.
+    static constexpr int kMaxPointsPerEntry = 4096;
 
     mutable std::mutex                    mtx_;
     std::unordered_map<int, Entry>        entries_;
