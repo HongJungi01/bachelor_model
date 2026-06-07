@@ -74,6 +74,15 @@ semantic_service/models/*
 semantic_service/runs/
 simulationyolo.yolov11/
 simulationyolo.yolov11.zip
+# Roboflow datasets + merged set (large, regenerable from sources/zip)
+--yolo.yolov11/
+--yolo.yolov11.zip
+msde_gp.yolov11/
+msde_gp.yolov11.zip
+merged.yolov11/
+# YOLO training run outputs
+test1/
+runs/
 # Ultralytics base weights auto-downloaded during training (not our artifact)
 yolo11*.pt
 yolo26*.pt
