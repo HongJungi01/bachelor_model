@@ -2124,7 +2124,7 @@ void PreferencesDialog::resetSettings(QGroupBox * groupBox)
 		{
 			_3dRenderingShowClouds[i]->setChecked(true);
 			_3dRenderingDecimation[i]->setValue(4);
-			_3dRenderingMaxDepth[i]->setValue(0.0);
+			_3dRenderingMaxDepth[i]->setValue(4.0);
 			_3dRenderingMinDepth[i]->setValue(0.0);
 			_3dRenderingRoiRatios[i]->setText("0.0 0.0 0.0 0.0");
 			_3dRenderingDepthConfidenceThr[i]->setValue(0);
@@ -2180,10 +2180,10 @@ void PreferencesDialog::resetSettings(QGroupBox * groupBox)
 	}
 	else if(groupBox->objectName() == _ui->groupBox_filtering2->objectName())
 	{
-		_ui->radioButton_noFiltering->setChecked(true);
-		_ui->radioButton_nodeFiltering->setChecked(false);
+		_ui->radioButton_noFiltering->setChecked(false);
+		_ui->radioButton_nodeFiltering->setChecked(true);
 		_ui->radioButton_subtractFiltering->setChecked(false);
-		_ui->doubleSpinBox_cloudFilterRadius->setValue(0.1);
+		_ui->doubleSpinBox_cloudFilterRadius->setValue(0.3);
 		_ui->doubleSpinBox_cloudFilterAngle->setValue(30);
 		_ui->spinBox_subtractFilteringMinPts->setValue(5);
 		_ui->doubleSpinBox_subtractFilteringRadius->setValue(0.02);
@@ -2223,7 +2223,8 @@ void PreferencesDialog::resetSettings(QGroupBox * groupBox)
 		_ui->lineEdit_calibrationFile->clear();
 		_ui->comboBox_sourceType->setCurrentIndex(kSrcRGBD);
 		_ui->lineEdit_sourceDevice->setText("");
-		_ui->lineEdit_sourceLocalTransform->setText("0 0 0 0 0 0");
+		// Project default: camera mounted level, 1.0 m above base_link.
+		_ui->lineEdit_sourceLocalTransform->setText("0 0 1 0 0 0");
 
 		_ui->source_comboBox_image_type->setCurrentIndex(kSrcUsbDevice-kSrcUsbDevice);
 		_ui->source_images_spinBox_startPos->setValue(0);
