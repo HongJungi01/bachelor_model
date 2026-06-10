@@ -55,9 +55,16 @@ public:
     using LabeledBox     = ::semantic::LabeledBox;
     // `mask` is CV_8UC1 (0 = background, >0 = wall pixel). May be empty —
     // callers fall back to box raster when it is.
+    // `detectorOk` is false when the detector never ran (HTTP/parse
+    // failure) — the frame carries no evidence either way, as opposed to a
+    // successful run that found zero detections.
+    // `rgb` is the keyframe image the inference ran on (BGR), so the GUI
+    // can render the result without re-fetching the frame.
     using ResultCallback = std::function<void(int nodeId,
                                                const std::vector<LabeledBox> & boxes,
-                                               const cv::Mat & mask)>;
+                                               const cv::Mat & mask,
+                                               bool detectorOk,
+                                               const cv::Mat & rgb)>;
 
     struct Frame {
         int     nodeId = -1;
@@ -135,12 +142,12 @@ private:
             cv::Mat mask;
             if (httpDetect(frame, labeled, mask))
             {
-                if (callback_) callback_(frame.nodeId, labeled, mask);
+                if (callback_) callback_(frame.nodeId, labeled, mask, true, frame.rgb);
             }
             else
             {
                 // Dispatch empty so MaskStore entries don't sit pending forever.
-                if (callback_) callback_(frame.nodeId, {}, cv::Mat());
+                if (callback_) callback_(frame.nodeId, {}, cv::Mat(), false, frame.rgb);
             }
         }
     }
@@ -157,7 +164,7 @@ private:
         lb.y2 = frame.rgb.rows * 0.85f;
         lb.label      = "centerLine";
         lb.confidence = 1.0f;
-        callback_(frame.nodeId, {lb}, cv::Mat());
+        callback_(frame.nodeId, {lb}, cv::Mat(), true, frame.rgb);
     }
 
     // ---- /detect ---------------------------------------------------------

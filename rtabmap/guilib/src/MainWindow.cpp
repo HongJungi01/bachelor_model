@@ -94,6 +94,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <QFileDialog>
 #include <QGraphicsEllipseItem>
 #include <QDockWidget>
+#include <QLabel>
 #include <QtCore/QBuffer>
 #include <QtCore/QTimer>
 #include <QtCore/QTime>
@@ -471,6 +472,18 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	_ui->menuTools->addAction(_actionSemanticUrl);
 	connect(_actionSemanticUrl, SIGNAL(triggered()), this, SLOT(setSemanticServiceUrl()));
 
+	// Semantic SLAM: dock mirroring the latest keyframe's YOLO inference
+	// (mask tint + labeled boxes). Updated from the worker callback in
+	// initSemanticWorker(); toggleable via Window > Show view.
+	_dockSemanticView = new QDockWidget(tr("Semantic"), this);
+	_dockSemanticView->setObjectName("dockWidget_semanticView");
+	_labelSemanticView = new QLabel(tr("Waiting for semantic inference..."), _dockSemanticView);
+	_labelSemanticView->setAlignment(Qt::AlignCenter);
+	_labelSemanticView->setMinimumSize(320, 180);
+	_dockSemanticView->setWidget(_labelSemanticView);
+	addDockWidget(Qt::RightDockWidgetArea, _dockSemanticView);
+	_ui->menuShow_view->addAction(_dockSemanticView->toggleViewAction());
+
 	_ui->actionPause->setShortcut(Qt::Key_Space);
 	_ui->actionSave_GUI_config->setShortcut(QKeySequence::Save);
 	// Qt5 issue, we should explicitly add actions not in
@@ -799,6 +812,73 @@ std::string MainWindow::resolveSemanticUrl() const
 	return std::string();
 }
 
+// Renders one keyframe's semantic inference (mask union + labeled boxes)
+// into a QImage for the "Semantic" dock.
+static QImage composeSemanticOverlay(
+		int nodeId,
+		const std::vector<::semantic::LabeledBox> & boxes,
+		const cv::Mat & mask,
+		bool detectorOk,
+		const cv::Mat & rgb)
+{
+	if(rgb.empty())
+	{
+		return QImage();
+	}
+
+	cv::Mat bgr;
+	if(rgb.channels() == 3)
+	{
+		bgr = rgb.clone();
+	}
+	else
+	{
+		cv::cvtColor(rgb, bgr, cv::COLOR_GRAY2BGR);
+	}
+
+	if(!mask.empty() && mask.type() == CV_8UC1)
+	{
+		cv::Mat m = mask;
+		if(m.size() != bgr.size())
+		{
+			cv::resize(m, m, bgr.size(), 0, 0, cv::INTER_NEAREST);
+		}
+		cv::Mat tint(bgr.size(), bgr.type(), cv::Scalar(0, 0, 255));
+		cv::Mat blended;
+		cv::addWeighted(bgr, 0.55, tint, 0.45, 0.0, blended);
+		blended.copyTo(bgr, m);
+	}
+
+	for(const auto & lb : boxes)
+	{
+		const cv::Rect r(cv::Point((int)lb.x1, (int)lb.y1),
+		                 cv::Point((int)lb.x2, (int)lb.y2));
+		cv::rectangle(bgr, r, cv::Scalar(0, 255, 0), 2);
+		char text[128];
+		snprintf(text, sizeof(text), "%s %.2f", lb.label.c_str(), lb.confidence);
+		cv::putText(bgr, text, r.tl() + cv::Point(0, -6),
+		            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+	}
+
+	char header[128];
+	if(detectorOk)
+	{
+		snprintf(header, sizeof(header), "node %d  det=%d", nodeId, (int)boxes.size());
+	}
+	else
+	{
+		snprintf(header, sizeof(header), "node %d  DETECTOR OFFLINE", nodeId);
+	}
+	cv::putText(bgr, header, cv::Point(10, 30),
+	            cv::FONT_HERSHEY_SIMPLEX, 0.9,
+	            detectorOk?cv::Scalar(255, 255, 255):cv::Scalar(0, 0, 255), 2);
+
+	cv::Mat rgbOut;
+	cv::cvtColor(bgr, rgbOut, cv::COLOR_BGR2RGB);
+	return QImage(rgbOut.data, rgbOut.cols, rgbOut.rows,
+	              (int)rgbOut.step, QImage::Format_RGB888).copy();
+}
+
 void MainWindow::initSemanticWorker(const std::string & url)
 {
 	// Tear down any existing worker first so its background thread joins
@@ -818,10 +898,30 @@ void MainWindow::initSemanticWorker(const std::string & url)
 	_semanticWorker.reset(new ::SemanticWorker(
 		::SemanticWorker::Mode::Http,
 		url,
-		[masksPtr](int nodeId,
+		[masksPtr, this](int nodeId,
 		           const std::vector<::semantic::LabeledBox> & boxes,
-		           const cv::Mat & mask) {
-			masksPtr->setLabeledBoxes(nodeId, boxes, mask);
+		           const cv::Mat & mask,
+		           bool detectorOk,
+		           const cv::Mat & rgb) {
+			masksPtr->setLabeledBoxes(nodeId, boxes, mask, detectorOk);
+
+			// Mirror the inference into the "Semantic" dock. This callback
+			// runs on the worker thread — hop to the GUI thread for the
+			// widget update.
+			const QImage overlay =
+				composeSemanticOverlay(nodeId, boxes, mask, detectorOk, rgb);
+			if(!overlay.isNull() && _labelSemanticView)
+			{
+				QMetaObject::invokeMethod(this, [this, overlay]() {
+					if(_labelSemanticView)
+					{
+						_labelSemanticView->setPixmap(QPixmap::fromImage(overlay).scaled(
+							_labelSemanticView->size(),
+							Qt::KeepAspectRatio,
+							Qt::SmoothTransformation));
+					}
+				}, Qt::QueuedConnection);
+			}
 		}));
 	UINFO("MainWindow: semantic SLAM enabled via URL=%s", url.c_str());
 }

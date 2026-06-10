@@ -20,6 +20,14 @@
  * Loop-closure pose corrections flow through automatically because poses
  * are looked up fresh on every applyTo() call.
  *
+ * Tag correction (negative-evidence voting): YOLO masks occasionally
+ * overshoot the real feature, and a write-once overlay would keep those
+ * wrong tags forever. Each keyframe therefore also stores sparse "clear"
+ * samples — floor pixels it observed with valid depth that were NOT part
+ * of any mask — and applyTo() tags a cell only while wall votes dominate
+ * (clearHits >= 2 * wallHits untags). A single overshooting frame is
+ * outvoted by later clean observations of the same cells.
+ *
  * Grid codes (semantic overlay on int8 occupancy grid):
  *   1      wall-like        centerLine, parkingLine
  *   0      skip             Arrow, rubberCone, sign, word, anything else
@@ -52,6 +60,9 @@ public:
         // applyTo() varies.
         std::vector<cv::Point3f> camPoints;
         std::vector<int8_t>      camCodes;       // same length as camPoints
+        // Camera-frame floor points this keyframe observed WITHOUT a mask —
+        // negative evidence applyTo() uses to outvote overshot tags.
+        std::vector<cv::Point3f> clearPoints;
         rtabmap::Transform       localTransform; // cam ↔ robot-base
         float                    zFloor = 0.0f;
 
@@ -78,6 +89,7 @@ public:
         e.pendingPose    = pose;
         e.camPoints.clear();
         e.camCodes.clear();
+        e.clearPoints.clear();
     }
 
     // Called by SemanticWorker when /detect labels arrive for nodeId.
@@ -89,9 +101,15 @@ public:
     // If `mask` is empty (mock mode, parse failure, no detections), falls
     // back to the legacy box raster path so the pipeline still produces
     // SOMETHING ray-castable.
+    //
+    // `detectorOk` distinguishes "YOLO ran and found nothing" (true — the
+    // keyframe contributes clear votes) from "detector never ran: HTTP
+    // failure, sidecar down" (false — no evidence either way; clear votes
+    // here would erode true tags whenever the sidecar is offline).
     void setLabeledBoxes(int nodeId,
                          const std::vector<semantic::LabeledBox> & boxes,
-                         const cv::Mat & mask = cv::Mat())
+                         const cv::Mat & mask = cv::Mat(),
+                         bool detectorOk = true)
     {
         std::lock_guard<std::mutex> lk(mtx_);
         auto it = entries_.find(nodeId);
@@ -101,6 +119,13 @@ public:
             return;
         }
         Entry & e = it->second;
+
+        if (!detectorOk)
+        {
+            e.pendingDepth = cv::Mat();
+            e.pendingCM    = rtabmap::CameraModel();
+            return;
+        }
 
         if (e.pendingCM.fx() <= 0.0f)
         {
@@ -137,11 +162,9 @@ public:
             else
                 cv::resize(mask, src, cv::Size(W, H), 0, 0, cv::INTER_NEAREST);
 
-            // Thicken thin lines (parkingLine masks are often 1-2 px wide)
-            // so the step=2 back-projection in buildCamPoints catches them.
-            // Default 3x3 kernel, 1 iteration → 1 px line becomes ~3 px.
-            cv::dilate(src, src, cv::Mat());
-
+            // No dilation here: it inflated every mask edge by a pixel and
+            // amplified YOLO overshoot. Thin (1-2 px) lines survive coarse
+            // sampling via the per-block scan in buildCamPoints instead.
             for (int v = 0; v < H; ++v)
             {
                 const uchar * srow = src.ptr<uchar>(v);
@@ -178,20 +201,31 @@ public:
         }
 
         const bool depthEmpty = e.pendingDepth.empty();
-        if (rasterised > 0)
-        {
-            const rtabmap::Transform T_cam2map = e.pendingPose * e.localTransform;
-            buildCamPoints(labeled, e.pendingCM, e.pendingDepth,
-                           e.zFloor, T_cam2map,
-                           e.camPoints, e.camCodes);
-        }
+        const rtabmap::Transform T_cam2map = e.pendingPose * e.localTransform;
 
-        UINFO("MaskStore[%d]: boxes=%zu anyWall=%d maskPath=%d "
-              "litPx=%d depthEmpty=%d camPoints=%zu zFloor=%.2f",
+        // The zFloor snapshotted at registration (sensor grid viewpoint) is
+        // typically 0, but the actual floor in MAP frame sits at
+        // -cameraHeight (the Unity source has no translation in its local
+        // transform) plus accumulated Z drift. With a wrong reference every
+        // floor-proximity gate below rejects ALL samples (camPoints=0).
+        // Estimate the floor from the depth image itself instead.
+        float zEst = 0.0f;
+        if (estimateFloorZ(e.pendingCM, e.pendingDepth, T_cam2map, zEst))
+            e.zFloor = zEst;
+
+        // Run even when nothing was rasterised (rasterised == 0): the clear
+        // pass inside still emits negative-evidence samples for the floor
+        // this keyframe observed mask-free.
+        buildCamPoints(labeled, e.pendingCM, e.pendingDepth,
+                       e.zFloor, T_cam2map,
+                       e.camPoints, e.camCodes, e.clearPoints);
+
+        UINFO("MaskStore[%d]: boxes=%zu anyWall=%d maskPath=%d rasterised=%d "
+              "litPx=%d depthEmpty=%d camPoints=%zu clearPts=%zu zFloor=%.2f",
               nodeId, boxes.size(), (int)anyWall,
               (int)(!mask.empty() && anyWall && mask.type() == CV_8UC1),
-              cv::countNonZero(labeled), (int)depthEmpty,
-              e.camPoints.size(), e.zFloor);
+              rasterised, cv::countNonZero(labeled), (int)depthEmpty,
+              e.camPoints.size(), e.clearPoints.size(), e.zFloor);
 
         // Release bulky data — mask store no longer needs it for this entry.
         e.pendingDepth = cv::Mat();
@@ -200,18 +234,32 @@ public:
 
     // Projects all stored camera-frame point clouds onto map8S using each
     // keyframe's CURRENT corrected pose. Only affine transforms — no
-    // ray-casting — happen here. Higher-priority codes (wall) cannot be
-    // overwritten by lower-priority codes (destination) within a single
-    // applyTo() call.
+    // ray-casting — happen here.
+    //
+    // Voting: per cell, count how many KEYFRAMES voted wall (mask sample
+    // landed there) vs clear (mask-free floor observed there); the voter
+    // mats deduplicate so dense per-frame sampling still counts as one
+    // vote. A cell is stamped wall only while clearVotes < 2 * wallVotes,
+    // so an overshooting mask is retracted after two clean observations
+    // while a consistently re-detected line keeps a comfortable margin.
     void applyTo(cv::Mat & map8S,
                  const std::map<int, rtabmap::Transform> & poses,
                  float xMin, float yMin, float cellSize) const
     {
         std::lock_guard<std::mutex> lk(mtx_);
+        if (map8S.empty()) return;
+
+        cv::Mat wallHits   = cv::Mat::zeros(map8S.size(), CV_16UC1);
+        cv::Mat clearHits  = cv::Mat::zeros(map8S.size(), CV_16UC1);
+        // Last nodeId that voted on a cell — collapses the many samples one
+        // keyframe drops into a single cell into one vote.
+        cv::Mat wallVoter  = cv::Mat(map8S.size(), CV_32SC1, cv::Scalar(-1));
+        cv::Mat clearVoter = cv::Mat(map8S.size(), CV_32SC1, cv::Scalar(-1));
+
         for (const auto & kv : entries_)
         {
             const Entry & e = kv.second;
-            if (e.camPoints.empty()) continue;
+            if (e.camPoints.empty() && e.clearPoints.empty()) continue;
 
             auto poseIt = poses.find(kv.first);
             if (poseIt == poses.end()) continue;
@@ -222,8 +270,7 @@ public:
             const size_t N = e.camPoints.size();
             for (size_t i = 0; i < N; ++i)
             {
-                const int8_t code = e.camCodes[i];
-                if (code == 0) continue;
+                if (e.camCodes[i] == 0) continue;
 
                 const cv::Point3f Pmap =
                     semantic::transformCamToMap(e.camPoints[i], T_cam2map);
@@ -238,9 +285,58 @@ public:
                 if (cx < 0 || cx >= map8S.cols) continue;
                 if (cy < 0 || cy >= map8S.rows) continue;
 
-                int8_t & cell = map8S.at<int8_t>(cy, cx);
-                if (priorityOf(cell) < priorityOf(code))
-                    cell = code;
+                int32_t & voter = wallVoter.at<int32_t>(cy, cx);
+                if (voter == kv.first) continue;
+                voter = kv.first;
+                uint16_t & h = wallHits.at<uint16_t>(cy, cx);
+                if (h < 65535) ++h;
+            }
+
+            for (const cv::Point3f & cp : e.clearPoints)
+            {
+                const cv::Point3f Pmap =
+                    semantic::transformCamToMap(cp, T_cam2map);
+
+                if (std::fabs(Pmap.z - e.zFloor) > 0.20f) continue;
+
+                const int cx = static_cast<int>(
+                    std::floor((Pmap.x - xMin) / cellSize));
+                const int cy = static_cast<int>(
+                    std::floor((Pmap.y - yMin) / cellSize));
+
+                // Clear samples sit on a coarse pixel lattice, so splat a
+                // 3x3 cell neighborhood for contiguous negative coverage.
+                for (int dy = -1; dy <= 1; ++dy)
+                {
+                    const int y = cy + dy;
+                    if (y < 0 || y >= map8S.rows) continue;
+                    for (int dx = -1; dx <= 1; ++dx)
+                    {
+                        const int x = cx + dx;
+                        if (x < 0 || x >= map8S.cols) continue;
+                        int32_t & voter = clearVoter.at<int32_t>(y, x);
+                        if (voter == kv.first) continue;
+                        voter = kv.first;
+                        uint16_t & h = clearHits.at<uint16_t>(y, x);
+                        if (h < 65535) ++h;
+                    }
+                }
+            }
+        }
+
+        // Final stamp. Only code 1 (wall) is in use; if more codes are ever
+        // added the counters need a per-code dimension.
+        for (int y = 0; y < map8S.rows; ++y)
+        {
+            const uint16_t * wrow = wallHits.ptr<uint16_t>(y);
+            const uint16_t * crow = clearHits.ptr<uint16_t>(y);
+            int8_t * mrow = map8S.ptr<int8_t>(y);
+            for (int x = 0; x < map8S.cols; ++x)
+            {
+                if (wrow[x] == 0) continue;
+                if (crow[x] >= 2 * wrow[x]) continue;  // outvoted — untag
+                if (priorityOf(mrow[x]) < priorityOf(1))
+                    mrow[x] = 1;
             }
         }
     }
@@ -285,8 +381,51 @@ private:
         return 0.0f;
     }
 
+    // Robust floor-height estimate in MAP frame: project a coarse lattice
+    // of the lower image half and take the 20th percentile of z — low
+    // enough to sit on the floor, robust against obstacles standing on it.
+    // Returns false (caller keeps the registered zFloor) when depth is
+    // missing or too few samples are valid.
+    static bool estimateFloorZ(
+        const rtabmap::CameraModel & cm,
+        const cv::Mat & depth,
+        const rtabmap::Transform & T_cam2map,
+        float & zOut)
+    {
+        if (depth.empty()) return false;
+
+        const float fx = static_cast<float>(cm.fx());
+        const float fy = static_cast<float>(cm.fy());
+        const float cx = static_cast<float>(cm.cx());
+        const float cy = static_cast<float>(cm.cy());
+
+        std::vector<float> zs;
+        zs.reserve(512);
+        const int step = std::max(8, depth.cols / 80);
+        for (int v = depth.rows / 2; v < depth.rows; v += step)
+        {
+            for (int u = 0; u < depth.cols; u += step)
+            {
+                const float d = readDepthMeters(depth, u, v);
+                if (d < 0.3f || d > kMaxSampleRange) continue;
+                const cv::Point3f Pcam = semantic::backprojectDepth(
+                    static_cast<float>(u), static_cast<float>(v),
+                    d, fx, fy, cx, cy);
+                zs.push_back(semantic::transformCamToMap(Pcam, T_cam2map).z);
+            }
+        }
+        if (zs.size() < 50) return false;
+
+        const size_t k = zs.size() / 5;
+        std::nth_element(zs.begin(), zs.begin() + k, zs.end());
+        zOut = zs[k];
+        return true;
+    }
+
     // Ray-cast: walks the labeled mask, projects every non-zero pixel onto
     // the floor plane, and emits parallel camera-frame point + code arrays.
+    // Also emits sparse clear samples (floor observed with valid depth, no
+    // mask) used as negative evidence by applyTo().
     static void buildCamPoints(
         const cv::Mat & labeledMask,
         const rtabmap::CameraModel & cm,
@@ -294,7 +433,8 @@ private:
         float zFloor,
         const rtabmap::Transform & T_cam2map,
         std::vector<cv::Point3f> & outPts,
-        std::vector<int8_t>      & outCodes)
+        std::vector<int8_t>      & outCodes,
+        std::vector<cv::Point3f> & outClearPts)
     {
         const float fx = static_cast<float>(cm.fx());
         const float fy = static_cast<float>(cm.fy());
@@ -303,6 +443,7 @@ private:
 
         outPts.clear();
         outCodes.clear();
+        outClearPts.clear();
         outPts.reserve(512);
         outCodes.reserve(512);
 
@@ -320,12 +461,34 @@ private:
                 static_cast<float>(kMaxPointsPerEntry));
             step = std::max(2, static_cast<int>(std::ceil(ratio)));
         }
+        if (totalLit > 0)
         for (int v = 0; v < labeledMask.rows; v += step)
         {
-            const uchar * row = labeledMask.ptr<uchar>(v);
+            const int vEnd = std::min(labeledMask.rows, v + step);
             for (int u = 0; u < labeledMask.cols; u += step)
             {
-                const int8_t code = static_cast<int8_t>(row[u]);
+                // Scan the whole step x step block for a lit pixel so thin
+                // (1-2 px) lines survive coarse sampling. This replaces the
+                // old mask dilation, which inflated every edge and amplified
+                // YOLO overshoot — here the point is emitted at the lit
+                // pixel's true position instead.
+                const int uEnd = std::min(labeledMask.cols, u + step);
+                int lu = -1, lv = -1;
+                int8_t code = 0;
+                for (int bv = v; bv < vEnd && code == 0; ++bv)
+                {
+                    const uchar * row = labeledMask.ptr<uchar>(bv);
+                    for (int bu = u; bu < uEnd; ++bu)
+                    {
+                        if (row[bu] != 0)
+                        {
+                            code = static_cast<int8_t>(row[bu]);
+                            lu = bu;
+                            lv = bv;
+                            break;
+                        }
+                    }
+                }
                 if (code == 0) continue;
 
                 cv::Point3f Pcam;
@@ -333,13 +496,13 @@ private:
 
                 // Path 1: depth-based (pose-independent)
                 if (!depth.empty() &&
-                    v < depth.rows && u < depth.cols)
+                    lv < depth.rows && lu < depth.cols)
                 {
-                    const float d = readDepthMeters(depth, u, v);
-                    if (d >= 0.3f && d <= 6.0f)
+                    const float d = readDepthMeters(depth, lu, lv);
+                    if (d >= 0.3f && d <= kMaxSampleRange)
                     {
                         Pcam = semantic::backprojectDepth(
-                            static_cast<float>(u), static_cast<float>(v),
+                            static_cast<float>(lu), static_cast<float>(lv),
                             d, fx, fy, cx, cy);
                         ok = true;
                     }
@@ -350,12 +513,19 @@ private:
                 {
                     cv::Point3f Pmap;
                     ok = semantic::rayPlaneIntersect(
-                        static_cast<float>(u), static_cast<float>(v),
+                        static_cast<float>(lu), static_cast<float>(lv),
                         fx, fy, cx, cy, T_cam2map, zFloor, Pmap);
                     if (ok)
                     {
                         const rtabmap::Transform T_map2cam = T_cam2map.inverse();
                         Pcam = semantic::transformCamToMap(Pmap, T_map2cam);
+                        // Near-horizon pixels intersect the floor far away,
+                        // so a mask spilling a few pixels upward would tag
+                        // cells meters from the sensor. Apply the same range
+                        // cap as the depth path.
+                        const float range = std::sqrt(
+                            Pcam.x*Pcam.x + Pcam.y*Pcam.y + Pcam.z*Pcam.z);
+                        if (range > kMaxSampleRange) ok = false;
                     }
                 }
 
@@ -370,6 +540,38 @@ private:
                 outCodes.push_back(code);
             }
         }
+
+        // Clear samples: coarse lattice over pixels that observed the floor
+        // (valid depth landing near zFloor) without any mask. Depth-only on
+        // purpose — without a depth reading we cannot know the ray actually
+        // reached the floor (it may hit an obstacle first), and a wrong
+        // clear vote erases true tags.
+        if (!depth.empty())
+        {
+            const int W = labeledMask.cols;
+            const int H = labeledMask.rows;
+            const int clearStep = std::max(4, static_cast<int>(std::ceil(
+                std::sqrt(static_cast<float>(W * H) /
+                          static_cast<float>(kMaxClearPerEntry)))));
+            outClearPts.reserve(kMaxClearPerEntry);
+            for (int v = 0; v < H && v < depth.rows; v += clearStep)
+            {
+                const uchar * row = labeledMask.ptr<uchar>(v);
+                for (int u = 0; u < W && u < depth.cols; u += clearStep)
+                {
+                    if (row[u] != 0) continue;
+                    const float d = readDepthMeters(depth, u, v);
+                    if (d < 0.3f || d > kMaxSampleRange) continue;
+                    const cv::Point3f Pcam = semantic::backprojectDepth(
+                        static_cast<float>(u), static_cast<float>(v),
+                        d, fx, fy, cx, cy);
+                    const cv::Point3f Pmap =
+                        semantic::transformCamToMap(Pcam, T_cam2map);
+                    if (std::fabs(Pmap.z - zFloor) > 0.15f) continue;
+                    outClearPts.push_back(Pcam);
+                }
+            }
+        }
     }
 
     // Per-entry raster sample budget. Each kept pixel becomes one cv::Point3f
@@ -377,6 +579,16 @@ private:
     // ~53 KB/entry → ~270 MB for 5k keyframes (~1 hr SLAM at 1.4 Hz keyframe
     // rate). Bumping this trades RAM for finer semantic detail.
     static constexpr int kMaxPointsPerEntry = 4096;
+
+    // Clear-sample budget per entry (12 B each → ~12 KB/entry, paid for
+    // EVERY keyframe, masked or not — ~60 MB for 5k keyframes). Drives the
+    // clear lattice spacing in buildCamPoints.
+    static constexpr int kMaxClearPerEntry = 1024;
+
+    // Shared range cap for depth reads and the ray-plane fallback. Beyond
+    // this D455 depth is mostly noise and floor intersections are the worst
+    // overshoot offenders.
+    static constexpr float kMaxSampleRange = 6.0f;
 
     mutable std::mutex                    mtx_;
     std::unordered_map<int, Entry>        entries_;

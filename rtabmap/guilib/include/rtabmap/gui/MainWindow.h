@@ -63,6 +63,8 @@ class GridTcpStreamer;
 class QGraphicsScene;
 class Ui_mainWindow;
 class QActionGroup;
+class QDockWidget;
+class QLabel;
 
 // Semantic SLAM (Phase-1: parking line tagging). Defined in
 // rtabmap/gui/semantic/{SemanticWorker,SemanticMaskStore}.h — forward-declared
@@ -461,6 +463,9 @@ private:
 	std::unique_ptr<::SemanticWorker>    _semanticWorker;
 	std::unique_ptr<::SemanticMaskStore> _semanticMasks;
 	QAction * _actionSemanticUrl;
+	// Dock mirroring the latest keyframe's YOLO inference (mask + boxes).
+	QDockWidget * _dockSemanticView = nullptr;
+	QLabel * _labelSemanticView = nullptr;
 
 	// QSettings("Semantic/url") wins; falls back to env RTABMAP_SEMANTIC_URL.
 	std::string resolveSemanticUrl() const;
