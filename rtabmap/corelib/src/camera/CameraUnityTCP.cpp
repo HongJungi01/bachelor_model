@@ -247,13 +247,44 @@ bool CameraUnityTCP::handleCalib(uint32_t payloadSize)
 		(float)lt[4], (float)lt[5], (float)lt[6], (float)lt[7],
 		(float)lt[8], (float)lt[9], (float)lt[10], (float)lt[11]);
 
+	// Unity is left-handed; if the sender folded the handedness flip into
+	// this matrix it is a reflection (determinant -1) and every transform
+	// chained on it corrupts the SLAM geometry. Detect it and fall back to
+	// the standard optical rotation, keeping the translation.
+	{
+		const float det =
+			localTransform.r11()*(localTransform.r22()*localTransform.r33() - localTransform.r23()*localTransform.r32())
+			- localTransform.r12()*(localTransform.r21()*localTransform.r33() - localTransform.r23()*localTransform.r31())
+			+ localTransform.r13()*(localTransform.r21()*localTransform.r32() - localTransform.r22()*localTransform.r31());
+		if (det < 0.0f)
+		{
+			UWARN("CameraUnityTCP: camera local transform from Unity has "
+			      "determinant %f (reflection). Replacing its rotation with "
+			      "the standard optical rotation — fix the Unity sender.", det);
+			const Transform optical = CameraModel::opticalRotation();
+			localTransform = Transform(
+				optical.r11(), optical.r12(), optical.r13(), localTransform.x(),
+				optical.r21(), optical.r22(), optical.r23(), localTransform.y(),
+				optical.r31(), optical.r32(), optical.r33(), localTransform.z());
+		}
+	}
+
 	{
 		std::lock_guard<std::mutex> lk(calibMtx_);
 		width_ = static_cast<int>(w);
 		height_ = static_cast<int>(h);
 		model_ = CameraModel("unity_d455", fx, fy, cx, cy, localTransform, 0.0,
 		                     cv::Size(width_, height_));
-		baseToImu_ = Transform(0, -1, 0, 0,
+		// The previous value had determinant -1 — a reflection, not a
+		// rotation (a left-handed Unity axis convention cannot be folded
+		// into a rotation matrix; the handedness flip belongs on the
+		// measurements themselves). Every Transform built from it spammed
+		// "doesn't have normalized rotation" warnings. Odometry currently
+		// ignores this IMU anyway (no orientation is sent), so use a proper
+		// rotation; before ever enabling IMU filtering, verify the axis
+		// mapping against the Unity sender (stationary car must read +9.81
+		// along base z after this transform).
+		baseToImu_ = Transform(0, 1, 0, 0,
 		                       0, 0, 1, 0,
 		                       1, 0, 0, 0);
 		calibrated_ = true;
