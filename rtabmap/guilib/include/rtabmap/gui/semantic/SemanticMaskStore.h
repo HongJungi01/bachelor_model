@@ -20,13 +20,16 @@
  * Loop-closure pose corrections flow through automatically because poses
  * are looked up fresh on every applyTo() call.
  *
- * Tag correction (negative-evidence voting): YOLO masks occasionally
+ * Tag correction (latest observation wins): YOLO masks occasionally
  * overshoot the real feature, and a write-once overlay would keep those
  * wrong tags forever. Each keyframe therefore also stores sparse "clear"
  * samples — floor pixels it observed with valid depth that were NOT part
- * of any mask — and applyTo() tags a cell only while wall votes dominate
- * (clearHits >= 2 * wallHits untags). A single overshooting frame is
- * outvoted by later clean observations of the same cells.
+ * of any mask. A cell keeps its tag only while the NEWEST keyframe that
+ * observed it saw it masked: one single mask-free observation of the
+ * cell permanently ERASES the wall samples on it (no voting, no
+ * threshold). Same-keyframe ties go to the mask so a frame's own clear
+ * lattice cannot kill the cells it just tagged. A later genuine
+ * re-detection re-tags the cell with fresh samples.
  *
  * Grid codes (semantic overlay on int8 occupancy grid):
  *   1      wall-like        centerLine, parkingLine
@@ -61,7 +64,7 @@ public:
         std::vector<cv::Point3f> camPoints;
         std::vector<int8_t>      camCodes;       // same length as camPoints
         // Camera-frame floor points this keyframe observed WITHOUT a mask —
-        // negative evidence applyTo() uses to outvote overshot tags.
+        // applyTo() erases any older tag these observations land on.
         std::vector<cv::Point3f> clearPoints;
         rtabmap::Transform       localTransform; // cam ↔ robot-base
         float                    zFloor = 0.0f;
@@ -236,26 +239,40 @@ public:
     // keyframe's CURRENT corrected pose. Only affine transforms — no
     // ray-casting — happen here.
     //
-    // Voting: per cell, count how many KEYFRAMES voted wall (mask sample
-    // landed there) vs clear (mask-free floor observed there); the voter
-    // mats deduplicate so dense per-frame sampling still counts as one
-    // vote. A cell is stamped wall only while clearVotes < 2 * wallVotes,
-    // so an overshooting mask is retracted after two clean observations
-    // while a consistently re-detected line keeps a comfortable margin.
+    // Latest observation wins (no voting): per cell, track the NEWEST
+    // keyframe that saw it masked (wall) and the newest that observed it
+    // mask-free (clear). If the clear observation is newer, the tag is
+    // stale: it is not stamped and every wall sample on the cell is
+    // permanently erased. Same-keyframe ties go to the mask, so a frame's
+    // own clear lattice splat cannot kill the cells it just tagged.
     void applyTo(cv::Mat & map8S,
                  const std::map<int, rtabmap::Transform> & poses,
-                 float xMin, float yMin, float cellSize) const
+                 float xMin, float yMin, float cellSize)
     {
         std::lock_guard<std::mutex> lk(mtx_);
         if (map8S.empty()) return;
 
-        cv::Mat wallHits   = cv::Mat::zeros(map8S.size(), CV_16UC1);
-        cv::Mat clearHits  = cv::Mat::zeros(map8S.size(), CV_16UC1);
-        // Last nodeId that voted on a cell — collapses the many samples one
-        // keyframe drops into a single cell into one vote.
-        cv::Mat wallVoter  = cv::Mat(map8S.size(), CV_32SC1, cv::Scalar(-1));
-        cv::Mat clearVoter = cv::Mat(map8S.size(), CV_32SC1, cv::Scalar(-1));
+        // Newest keyframe id observing each cell as wall / clear (-1 = never).
+        // Keyframe ids increase monotonically, so id comparison == recency.
+        cv::Mat lastWall  = cv::Mat(map8S.size(), CV_32SC1, cv::Scalar(-1));
+        cv::Mat lastClear = cv::Mat(map8S.size(), CV_32SC1, cv::Scalar(-1));
 
+        // Maps a camera-frame point to its grid cell with the same gating
+        // everywhere. Returns false when the point does not land on a
+        // valid floor cell.
+        const auto cellOf = [&](const cv::Point3f & pCam,
+                                const rtabmap::Transform & T_cam2map,
+                                float zFloor, int & cx, int & cy) -> bool
+        {
+            const cv::Point3f Pmap = semantic::transformCamToMap(pCam, T_cam2map);
+            // Reject if loop-closure correction moved the point off the floor.
+            if (std::fabs(Pmap.z - zFloor) > 0.20f) return false;
+            cx = static_cast<int>(std::floor((Pmap.x - xMin) / cellSize));
+            cy = static_cast<int>(std::floor((Pmap.y - yMin) / cellSize));
+            return cx >= 0 && cx < map8S.cols && cy >= 0 && cy < map8S.rows;
+        };
+
+        // Pass 1: record the newest wall / clear observation per cell.
         for (const auto & kv : entries_)
         {
             const Entry & e = kv.second;
@@ -272,40 +289,20 @@ public:
             {
                 if (e.camCodes[i] == 0) continue;
 
-                const cv::Point3f Pmap =
-                    semantic::transformCamToMap(e.camPoints[i], T_cam2map);
+                int cx, cy;
+                if (!cellOf(e.camPoints[i], T_cam2map, e.zFloor, cx, cy)) continue;
 
-                // Reject if loop-closure correction moved the point off the floor.
-                if (std::fabs(Pmap.z - e.zFloor) > 0.20f) continue;
-
-                const int cx = static_cast<int>(
-                    std::floor((Pmap.x - xMin) / cellSize));
-                const int cy = static_cast<int>(
-                    std::floor((Pmap.y - yMin) / cellSize));
-                if (cx < 0 || cx >= map8S.cols) continue;
-                if (cy < 0 || cy >= map8S.rows) continue;
-
-                int32_t & voter = wallVoter.at<int32_t>(cy, cx);
-                if (voter == kv.first) continue;
-                voter = kv.first;
-                uint16_t & h = wallHits.at<uint16_t>(cy, cx);
-                if (h < 65535) ++h;
+                int32_t & lw = lastWall.at<int32_t>(cy, cx);
+                if (kv.first > lw) lw = kv.first;
             }
 
             for (const cv::Point3f & cp : e.clearPoints)
             {
-                const cv::Point3f Pmap =
-                    semantic::transformCamToMap(cp, T_cam2map);
-
-                if (std::fabs(Pmap.z - e.zFloor) > 0.20f) continue;
-
-                const int cx = static_cast<int>(
-                    std::floor((Pmap.x - xMin) / cellSize));
-                const int cy = static_cast<int>(
-                    std::floor((Pmap.y - yMin) / cellSize));
+                int cx, cy;
+                if (!cellOf(cp, T_cam2map, e.zFloor, cx, cy)) continue;
 
                 // Clear samples sit on a coarse pixel lattice, so splat a
-                // 3x3 cell neighborhood for contiguous negative coverage.
+                // 3x3 cell neighborhood for contiguous coverage.
                 for (int dy = -1; dy <= 1; ++dy)
                 {
                     const int y = cy + dy;
@@ -314,27 +311,80 @@ public:
                     {
                         const int x = cx + dx;
                         if (x < 0 || x >= map8S.cols) continue;
-                        int32_t & voter = clearVoter.at<int32_t>(y, x);
-                        if (voter == kv.first) continue;
-                        voter = kv.first;
-                        uint16_t & h = clearHits.at<uint16_t>(y, x);
-                        if (h < 65535) ++h;
+                        int32_t & lc = lastClear.at<int32_t>(y, x);
+                        if (kv.first > lc) lc = kv.first;
                     }
                 }
             }
         }
 
-        // Final stamp. Only code 1 (wall) is in use; if more codes are ever
-        // added the counters need a per-code dimension.
+        // Pass 2: stale = the newest observation of a tagged cell is
+        // mask-free (strictly newer: a tie means the same keyframe both
+        // tagged the cell and grazed it with its clear lattice — the mask
+        // wins).
+        cv::Mat stale = cv::Mat::zeros(map8S.size(), CV_8UC1);
+        bool anyStale = false;
         for (int y = 0; y < map8S.rows; ++y)
         {
-            const uint16_t * wrow = wallHits.ptr<uint16_t>(y);
-            const uint16_t * crow = clearHits.ptr<uint16_t>(y);
+            const int32_t * lwrow = lastWall.ptr<int32_t>(y);
+            const int32_t * lcrow = lastClear.ptr<int32_t>(y);
+            uchar * srow = stale.ptr<uchar>(y);
+            for (int x = 0; x < map8S.cols; ++x)
+            {
+                if (lwrow[x] >= 0 && lcrow[x] > lwrow[x])
+                {
+                    srow[x] = 1;
+                    anyStale = true;
+                }
+            }
+        }
+
+        // Pass 3: permanently erase wall samples on stale cells. Clear
+        // samples stay — under latest-wins they cannot block a future
+        // re-detection (a newer wall observation always outranks them).
+        if (anyStale)
+        {
+            size_t prunedWall = 0;
+            for (auto & kv : entries_)
+            {
+                Entry & e = kv.second;
+                if (e.camPoints.empty()) continue;
+
+                auto poseIt = poses.find(kv.first);
+                if (poseIt == poses.end()) continue;
+
+                const rtabmap::Transform T_cam2map =
+                    poseIt->second * e.localTransform;
+
+                size_t w = 0;
+                for (size_t i = 0; i < e.camPoints.size(); ++i)
+                {
+                    int cx, cy;
+                    const bool drop =
+                        e.camCodes[i] != 0 &&
+                        cellOf(e.camPoints[i], T_cam2map, e.zFloor, cx, cy) &&
+                        stale.at<uchar>(cy, cx) != 0;
+                    if (drop) { ++prunedWall; continue; }
+                    e.camPoints[w] = e.camPoints[i];
+                    e.camCodes[w]  = e.camCodes[i];
+                    ++w;
+                }
+                e.camPoints.resize(w);
+                e.camCodes.resize(w);
+            }
+            UINFO("MaskStore: erased %zu wall samples on cells observed mask-free",
+                  prunedWall);
+        }
+
+        // Final stamp. Only code 1 (wall) is in use.
+        for (int y = 0; y < map8S.rows; ++y)
+        {
+            const int32_t * lwrow = lastWall.ptr<int32_t>(y);
+            const uchar * srow = stale.ptr<uchar>(y);
             int8_t * mrow = map8S.ptr<int8_t>(y);
             for (int x = 0; x < map8S.cols; ++x)
             {
-                if (wrow[x] == 0) continue;
-                if (crow[x] >= 2 * wrow[x]) continue;  // outvoted — untag
+                if (lwrow[x] < 0 || srow[x] != 0) continue;
                 if (priorityOf(mrow[x]) < priorityOf(1))
                     mrow[x] = 1;
             }
