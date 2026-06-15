@@ -102,6 +102,10 @@
           ]
         },
         {
+          "name": "qtserialport",
+          "default-features": false
+        },
+        {
           "name": "vtk",
           "default-features": false
         }

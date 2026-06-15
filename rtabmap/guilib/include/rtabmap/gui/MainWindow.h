@@ -58,6 +58,8 @@ class CloudViewer;
 class LoopClosureViewer;
 class OccupancyGrid;
 class GridTcpStreamer;
+class MapPathView;
+class ControllerPanel;
 }
 
 class QGraphicsScene;
@@ -466,6 +468,17 @@ private:
 	// Dock mirroring the latest keyframe's YOLO inference (mask + boxes).
 	QDockWidget * _dockSemanticView = nullptr;
 	QLabel * _labelSemanticView = nullptr;
+
+	// 4-quadrant dashboard docks (created in C++, like the Semantic dock):
+	//   Map+Path = 2D map + planned path (bottom-right),
+	//   Controller = Default Controller / PID serial (top-right).
+	QDockWidget * _dockMapPath = nullptr;
+	MapPathView * _mapPathView = nullptr;
+	QDockWidget * _dockController = nullptr;
+	ControllerPanel * _controllerPanel = nullptr;
+	// Tile the four docks into a 2x2: Odometry top-left / Controller top-right /
+	// Semantic bottom-left / Map+Path bottom-right.
+	void applyQuadrantLayout();
 
 	// QSettings("Semantic/url") wins; falls back to env RTABMAP_SEMANTIC_URL.
 	std::string resolveSemanticUrl() const;

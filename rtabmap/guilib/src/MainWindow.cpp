@@ -67,6 +67,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "rtabmap/gui/StatsToolBox.h"
 #include "rtabmap/gui/ProgressDialog.h"
 #include "rtabmap/gui/CloudViewer.h"
+#include "MapPathView.h"
+#include "ControllerPanel.h"
 #include "rtabmap/gui/LoopClosureViewer.h"
 #include "rtabmap/gui/ExportCloudsDialog.h"
 #include "rtabmap/gui/ExportBundlerDialog.h"
@@ -262,6 +264,38 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	this->setWindowIconText(tr("RTAB-Map"));
 	this->setObjectName("MainWindow");
 
+	// 4-quadrant dashboard docks, created here (before setDefaultViews so they can
+	// be tiled, and before loadMainWindowState so saved positions can be restored).
+	// Final tiling (see applyQuadrantLayout): Odometry top-left, Controller top-right,
+	// Semantic bottom-left, Map+Path bottom-right.
+	// Semantic (bottom-left): mirrors the latest keyframe's YOLO inference (mask + boxes),
+	// updated from the worker callback in initSemanticWorker().
+	_dockSemanticView = new QDockWidget(tr("Semantic"), this);
+	_dockSemanticView->setObjectName("dockWidget_semanticView");
+	_labelSemanticView = new QLabel(tr("Waiting for semantic inference..."), _dockSemanticView);
+	_labelSemanticView->setAlignment(Qt::AlignCenter);
+	_labelSemanticView->setMinimumSize(320, 180);
+	_dockSemanticView->setWidget(_labelSemanticView);
+	addDockWidget(Qt::RightDockWidgetArea, _dockSemanticView);
+	_ui->menuShow_view->addAction(_dockSemanticView->toggleViewAction());
+
+	// Map + Path (bottom-right): 2D occupancy map with the live D* Lite planned path
+	// (fed directly from updateMapCloud; replaces the built-in graph view).
+	_dockMapPath = new QDockWidget(tr("Map + Path"), this);
+	_dockMapPath->setObjectName("dockWidget_mapPath");
+	_mapPathView = new MapPathView(_dockMapPath);
+	_dockMapPath->setWidget(_mapPathView);
+	addDockWidget(Qt::LeftDockWidgetArea, _dockMapPath);
+	_ui->menuShow_view->addAction(_dockMapPath->toggleViewAction());
+
+	// Controller (top-right): PID speed/steering serial debug panel.
+	_dockController = new QDockWidget(tr("Controller"), this);
+	_dockController->setObjectName("dockWidget_controller");
+	_controllerPanel = new ControllerPanel(_dockController);
+	_dockController->setWidget(_controllerPanel);
+	addDockWidget(Qt::RightDockWidgetArea, _dockController);
+	_ui->menuShow_view->addAction(_dockController->toggleViewAction());
+
 	//Setup dock widgets position if it is the first time the application is started.
 	setDefaultViews();
 
@@ -283,6 +317,21 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	// Restore window geometry
 	bool statusBarShown = false;
 	_preferencesDialog->loadMainWindowState(this, _savedMaximized, statusBarShown);
+	// One-time migration to the 4-quadrant dashboard: loadMainWindowState() above
+	// re-applies any pre-existing saved arrangement (which would clobber the default
+	// dashboard set just before). If the saved config predates the current layout,
+	// force the dashboard once and persist it; the version stamp then lets user
+	// changes stick. Bumped to 2 to re-tile pre-existing dashboards into the new
+	// quadrant order (Odometry/Controller over Semantic/Map+Path).
+	{
+		QSettings layoutSettings(_preferencesDialog->getIniFilePath(), QSettings::IniFormat);
+		if(layoutSettings.value("Gui/dashboardLayoutVersion", 0).toInt() < 2)
+		{
+			setDefaultViews();
+			_preferencesDialog->saveMainWindowState(this);
+			layoutSettings.setValue("Gui/dashboardLayoutVersion", 2);
+		}
+	}
 	_preferencesDialog->loadWindowGeometry(_preferencesDialog);
 	_preferencesDialog->loadWindowGeometry(_exportCloudsDialog);
 	_preferencesDialog->loadWindowGeometry(_exportBundlerDialog);
@@ -471,18 +520,8 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	_actionSemanticUrl = new QAction(tr("Set Semantic Service URL..."), this);
 	_ui->menuTools->addAction(_actionSemanticUrl);
 	connect(_actionSemanticUrl, SIGNAL(triggered()), this, SLOT(setSemanticServiceUrl()));
-
-	// Semantic SLAM: dock mirroring the latest keyframe's YOLO inference
-	// (mask tint + labeled boxes). Updated from the worker callback in
-	// initSemanticWorker(); toggleable via Window > Show view.
-	_dockSemanticView = new QDockWidget(tr("Semantic"), this);
-	_dockSemanticView->setObjectName("dockWidget_semanticView");
-	_labelSemanticView = new QLabel(tr("Waiting for semantic inference..."), _dockSemanticView);
-	_labelSemanticView->setAlignment(Qt::AlignCenter);
-	_labelSemanticView->setMinimumSize(320, 180);
-	_dockSemanticView->setWidget(_labelSemanticView);
-	addDockWidget(Qt::RightDockWidgetArea, _dockSemanticView);
-	_ui->menuShow_view->addAction(_dockSemanticView->toggleViewAction());
+	// Note: the Semantic dock itself is created earlier (with the Map+Path and
+	// Controller dashboard docks) so setDefaultViews() can tile all four.
 
 	_ui->actionPause->setShortcut(Qt::Key_Space);
 	_ui->actionSave_GUI_config->setShortcut(QKeySequence::Save);
@@ -3842,6 +3881,20 @@ void MainWindow::updateMapCloud(
 					poseYaw = _lastOdomPose.theta();
 				}
 				_gridTcpStreamer->sendGrid(map8S, xMin, yMin, resolution, poseX, poseY, poseYaw);
+			}
+
+			// Feed the Map+Path dock (quadrant 3) with the same grid + pose,
+			// directly (no loopback socket). map8S already carries semantic codes.
+			if(_mapPathView)
+			{
+				float pX = 0, pY = 0, pYaw = 0;
+				if(!_lastOdomPose.isNull())
+				{
+					pX = _lastOdomPose.x();
+					pY = _lastOdomPose.y();
+					pYaw = _lastOdomPose.theta();
+				}
+				_mapPathView->updateGrid(map8S, xMin, yMin, resolution, pX, pY, pYaw);
 			}
 
 			if(_cloudViewer->isVisible() && _preferencesDialog->getGridMapShown())
@@ -8103,11 +8156,16 @@ void MainWindow::setDefaultViews()
 	_ui->dockWidget_console->setVisible(false);
 	_ui->dockWidget_loopClosureViewer->setVisible(false);
 	_ui->dockWidget_mapVisibility->setVisible(false);
-	_ui->dockWidget_graphViewer->setVisible(true);
+	// 4-quadrant dashboard: hide the stock graph/3D/loop-closure docks in favour of
+	// Odometry (top-left) + Controller (top-right) + Semantic (bottom-left) + Map+Path (bottom-right).
+	_ui->dockWidget_graphViewer->setVisible(false);
 	_ui->dockWidget_odometry->setVisible(true);
-	_ui->dockWidget_cloudViewer->setVisible(true);
-	_ui->dockWidget_imageView->setVisible(true);
+	_ui->dockWidget_cloudViewer->setVisible(false);
+	_ui->dockWidget_imageView->setVisible(false);
 	_ui->dockWidget_multiSessionLoc->setVisible(false);
+	if(_dockSemanticView) _dockSemanticView->setVisible(true);
+	if(_dockMapPath)      _dockMapPath->setVisible(true);
+	if(_dockController)   _dockController->setVisible(true);
 	_ui->toolBar->setVisible(_state != kMonitoring && _state != kMonitoringPaused);
 	_ui->toolBar_2->setVisible(true);
 	_ui->statusbar->setVisible(false);
@@ -8115,6 +8173,39 @@ void MainWindow::setDefaultViews()
 	_cloudViewer->resetCamera();
 	_cloudViewer->setCameraLockZ(true);
 	_cloudViewer->setCameraTargetFollow(true);
+	applyQuadrantLayout();
+}
+
+void MainWindow::applyQuadrantLayout()
+{
+	// Tile the four dashboard docks into a 2x2 grid:
+	//   Odometry   (top-left)    | Controller (top-right)
+	//   Semantic   (bottom-left) | Map+Path   (bottom-right)
+	if(!_dockSemanticView || !_dockMapPath || !_dockController)
+		return;
+
+	// Build rows-first so the top/bottom divider is a single shared split: this keeps
+	// the bottom row from collapsing under the Controller's preferred height (a
+	// columns-first build gives each column its own divider, and the Controller-heavy
+	// right column then drags the bottom edge up). Then split each row into its columns.
+	addDockWidget(Qt::LeftDockWidgetArea, _ui->dockWidget_odometry);
+	splitDockWidget(_ui->dockWidget_odometry, _dockSemanticView, Qt::Vertical);    // top / bottom rows
+	splitDockWidget(_ui->dockWidget_odometry, _dockController,   Qt::Horizontal);  // top row:    Odometry | Controller
+	splitDockWidget(_dockSemanticView,        _dockMapPath,      Qt::Horizontal);  // bottom row: Semantic | Map+Path
+
+	_ui->dockWidget_odometry->show();
+	_dockSemanticView->show();
+	_dockMapPath->show();
+	_dockController->show();
+
+#if QT_VERSION >= 0x050600
+	resizeDocks(QList<QDockWidget*>() << _ui->dockWidget_odometry << _dockController,
+	            QList<int>() << 1 << 1, Qt::Horizontal);
+	resizeDocks(QList<QDockWidget*>() << _dockSemanticView << _dockMapPath,
+	            QList<int>() << 1 << 1, Qt::Horizontal);
+	resizeDocks(QList<QDockWidget*>() << _ui->dockWidget_odometry << _dockSemanticView,
+	            QList<int>() << 3 << 2, Qt::Vertical);
+#endif
 }
 
 void MainWindow::selectScreenCaptureFormat(bool checked)

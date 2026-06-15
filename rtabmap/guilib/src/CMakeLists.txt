@@ -85,6 +85,12 @@ SET(SRC_FILES
 	./DepthCalibrationDialog.cpp
 	./LinkRefiningDialog.cpp
 	./GridTcpStreamer.cpp
+	./MapPathView.cpp
+	./MapPathView.h
+	./ControllerPanel.cpp
+	./ControllerPanel.h
+	./planning/DStarLite.cpp
+	./planning/DStarLite.h
 	./3rdParty/QMultiComboBox.cpp
 	./opencv/vtkImageMatSource.cpp
 	${qrc}
@@ -115,6 +121,12 @@ IF(Qt6_FOUND)
     IF(Qt6Svg_FOUND)
         SET(LIBRARIES ${LIBRARIES} Qt6::Svg)
     ENDIF()
+    # Qt SerialPort (qtserialport vcpkg port) — powers the Controller dock.
+    # Optional so the GUI still builds if the module is unavailable.
+    IF(TARGET Qt6::SerialPort)
+        SET(LIBRARIES ${LIBRARIES} Qt6::SerialPort)
+        ADD_DEFINITIONS(-DRTABMAP_HAVE_QT_SERIALPORT)
+    ENDIF()
     SET(PUBLIC_INCLUDE_DIRS
         ${PUBLIC_INCLUDE_DIRS}
         ${Qt6Widgets_INCLUDE_DIRS}
@@ -126,6 +138,11 @@ ELSEIF(Qt5_FOUND)
     SET(LIBRARIES ${LIBRARIES} Qt5::PrintSupport)
     IF(Qt5Svg_FOUND)
         SET(LIBRARIES ${LIBRARIES} Qt5::Svg)
+    ENDIF()
+    # Qt SerialPort (qt5-serialport) — powers the Controller dock. Optional.
+    IF(TARGET Qt5::SerialPort)
+        SET(LIBRARIES ${LIBRARIES} Qt5::SerialPort)
+        ADD_DEFINITIONS(-DRTABMAP_HAVE_QT_SERIALPORT)
     ENDIF()
     SET(PUBLIC_INCLUDE_DIRS
         ${PUBLIC_INCLUDE_DIRS}
