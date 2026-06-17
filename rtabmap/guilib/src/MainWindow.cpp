@@ -1362,8 +1362,12 @@ void MainWindow::processOdometry(const rtabmap::OdometryEvent & odom, bool dataI
 		_ui->imageView_odometry->setBackgroundColor(_ui->imageView_odometry->getDefaultBackgroundColor());
 	}
 
-	if(!pose.isNull() && (_ui->dockWidget_cloudViewer->isVisible() || _ui->graphicsView_graphView->isVisible()))
+	if(!pose.isNull() && (_ui->dockWidget_cloudViewer->isVisible() || _ui->graphicsView_graphView->isVisible() ||
+	                      (_dockMapPath && _dockMapPath->isVisible())))
 	{
+		// Also keep this fresh for the dashboard's Map+Path dock (and TCP grid stream),
+		// whose robot marker would otherwise freeze at the origin because the stock
+		// cloud/graph docks that used to gate this are hidden in the 4-quadrant layout.
 		_lastOdomPose = pose;
 	}
 
@@ -3832,9 +3836,25 @@ void MainWindow::updateMapCloud(
 	}
 	cv::Mat map8U;
 	bool tcpStreamingActive = _gridTcpStreamer && _gridTcpStreamer->isListening() && _gridTcpStreamer->clientCount() > 0;
-	if((_ui->graphicsView_graphView->isVisible() && _ui->graphicsView_graphView->isGridMapVisible()) ||
+	// Legacy consumers (graph view / 3D cloud grid / TCP clients) want the grid every
+	// frame, as before. The dashboard's Map+Path dock also needs it, but it is hidden
+	// from this condition in the default layout (graph/cloud docks are hidden), which is
+	// why it used to sit on "Waiting for map...". Add it here, but throttled to ~4 Hz so
+	// feeding it doesn't recompute the full occupancy grid + replan on every odometry tick.
+	bool legacyGridConsumer =
+	   (_ui->graphicsView_graphView->isVisible() && _ui->graphicsView_graphView->isGridMapVisible()) ||
 	   (_cloudViewer->isVisible() && _preferencesDialog->getGridMapShown()) ||
-	   tcpStreamingActive)
+	   tcpStreamingActive;
+	bool mapPathConsumer = false;
+	if(!legacyGridConsumer && _mapPathView && _dockMapPath && _dockMapPath->isVisible())
+	{
+		if(!_mapPathGridTimer.isValid() || _mapPathGridTimer.elapsed() >= 250)
+		{
+			_mapPathGridTimer.restart();
+			mapPathConsumer = true;
+		}
+	}
+	if(legacyGridConsumer || mapPathConsumer)
 	{
 		float xMin, yMin;
 		float resolution = _occupancyGrid->getCellSize();
@@ -3885,14 +3905,18 @@ void MainWindow::updateMapCloud(
 
 			// Feed the Map+Path dock (quadrant 3) with the same grid + pose,
 			// directly (no loopback socket). map8S already carries semantic codes.
+			// The grid is in the map frame, so the robot pose must be the map-frame
+			// pose (mapCorrection * odom) — not the raw odometry pose, which lives in
+			// the odom frame and would drift off the map after loop closures.
 			if(_mapPathView)
 			{
 				float pX = 0, pY = 0, pYaw = 0;
 				if(!_lastOdomPose.isNull())
 				{
-					pX = _lastOdomPose.x();
-					pY = _lastOdomPose.y();
-					pYaw = _lastOdomPose.theta();
+					Transform mapPose = _odometryCorrection * _lastOdomPose;
+					pX = mapPose.x();
+					pY = mapPose.y();
+					pYaw = mapPose.theta();
 				}
 				_mapPathView->updateGrid(map8S, xMin, yMin, resolution, pX, pY, pYaw);
 			}

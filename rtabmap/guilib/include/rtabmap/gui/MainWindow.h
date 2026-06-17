@@ -474,6 +474,10 @@ private:
 	//   Controller = Default Controller / PID serial (top-right).
 	QDockWidget * _dockMapPath = nullptr;
 	MapPathView * _mapPathView = nullptr;
+	// Throttle for the Map+Path occupancy-grid feed: the 2D grid changes slowly, so
+	// recomputing it on every (high-rate) odometry update needlessly pins the GUI
+	// thread + planner worker. Feed it at ~4 Hz instead. Invalid until first feed.
+	QElapsedTimer _mapPathGridTimer;
 	QDockWidget * _dockController = nullptr;
 	ControllerPanel * _controllerPanel = nullptr;
 	// Tile the four docks into a 2x2: Odometry top-left / Controller top-right /
