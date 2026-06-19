@@ -93,8 +93,9 @@ def process_dataset(name: str, src_dir: Path, remap):
 
 def write_yaml():
     yaml_path = OUT / "data.yaml"
+    # `path:` 의도적으로 생략 -> ultralytics가 이 yaml 폴더 기준으로 train/val을
+    # 해석하므로 merged.yolov11을 그대로 zip해서 RunPod /workspace에 풀어도 동작(이식성).
     content = (
-        f"path: {OUT.as_posix()}\n"
         "train: train/images\n"
         "val: train/images   # 별도 검증셋 없음 - train과 동일 경로\n"
         f"nc: {len(NAMES)}\n"
