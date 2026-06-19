@@ -48,6 +48,8 @@ from dstar_core3 import (
     reset_and_replan,
     calc_edge_cost,
     update_dist_wall_map,
+    D_MAX,
+    D_MAX_UNKNOWN,
 )
 
 # --- 네트워크 / 와이어 포맷 (grid_client.py 와 동일) ------------------------
@@ -155,6 +157,7 @@ class PathGenerator:
         self.rhs_map = np.full((h, w), np.inf, dtype=np.float64)
         self.local_grid = np.zeros((h, w), dtype=np.int32)
         self.dist_wall_map = np.full((h, w), 30.0, dtype=np.float64)
+        self.dist_unknown_map = np.full((h, w), 30.0, dtype=np.float64)
         self.pq = List.empty_list(
             types.Tuple((types.float64, types.float64, types.int64, types.int64))
         )
@@ -162,6 +165,7 @@ class PathGenerator:
     def _extract_path(self, start, goal):
         """현재 g_map 을 따라 start→goal 경로를 그리디 하강으로 추출 (셀 리스트)."""
         g, lg, dw = self.g_map, self.local_grid, self.dist_wall_map
+        duw = self.dist_unknown_map
         path = [start]
         cur = start
         seen = {start}
@@ -176,7 +180,7 @@ class PathGenerator:
                         continue
                     nx, ny = cx + dx, cy + dy
                     if 0 <= nx < self.gw and 0 <= ny < self.gh:
-                        c = calc_edge_cost(cx, cy, nx, ny, lg, dw, 3) + g[ny, nx]
+                        c = calc_edge_cost(cx, cy, nx, ny, lg, dw, duw, 3) + g[ny, nx]
                         if c < best:
                             best, nxt = c, (nx, ny)
             if nxt == cur or best == np.inf or nxt in seen:
@@ -196,7 +200,8 @@ class PathGenerator:
         h, w = raw.shape
         self._ensure(w, h)
         self.local_grid[:, :] = to_planner_grid(raw)
-        update_dist_wall_map(self.local_grid, self.dist_wall_map, 3.0)
+        update_dist_wall_map(self.local_grid, self.dist_wall_map, D_MAX, 100)
+        update_dist_wall_map(self.local_grid, self.dist_unknown_map, D_MAX_UNKNOWN, 255)
 
         # 시작 = 로봇 pose
         sx, sy = world_to_cell(meta["px"], meta["py"], meta)
@@ -222,7 +227,7 @@ class PathGenerator:
         reset_and_replan(
             sx, sy, gx, gy,
             self.g_map, self.rhs_map, self.local_grid, self.dist_wall_map,
-            self.pq, 0.0, 3,
+            self.dist_unknown_map, self.pq, 0.0, 3,
         )
         self.path_cells = self._extract_path((sx, sy), (gx, gy))
         return [cell_to_world(c, r, meta) for c, r in self.path_cells]

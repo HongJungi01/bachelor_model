@@ -23,8 +23,12 @@ const double COST_OBSTACLE        = 10000.0;
 const double COST_UNEXPLORED      = 50.0;
 const double COST_UNEXPLORED_DIAG = 70.7;
 
-const double D_MAX              = 3.0;
-const double W_MARGIN           = 50.0;
+const double D_MAX              = 8.0;   // wall clearance band (cells; ~0.4 m @ 0.05)
+const double W_MARGIN           = 50.0;  // wall margin weight (graded toward centreline)
+// Separate, gentler clearance from unexplored space: nudges the path off the unknown
+// frontier without the strong push that would block goal/frontier progress.
+const double D_MAX_UNKNOWN      = 5.0;   // unknown clearance band (cells; ~0.25 m @ 0.05)
+const double W_MARGIN_UNKNOWN   = 20.0;  // unknown margin weight (< W_MARGIN)
 const int    TEMPORAL_THRESHOLD = 3;
 
 const int    HINT_DEPTH_K   = 4;
@@ -103,7 +107,8 @@ void PathGenerator::reset()
 	// Drop sizing so the next compute() re-initialises everything (== Python
 	// reconstructing PathGenerator). reset_and_replan also fills g/rhs anew.
 	gw_ = gh_ = 0;
-	gMap_.clear(); rhsMap_.clear(); localGrid_.clear(); distWallMap_.clear();
+	gMap_.clear(); rhsMap_.clear(); localGrid_.clear();
+	distWallMap_.clear(); distUnknownMap_.clear();
 	pathCells_.clear();
 	hasStart_ = hasGoal_ = false;
 	goalSrc_ = GOAL_NONE;
@@ -119,18 +124,20 @@ void PathGenerator::ensure(int w, int h)
 	rhsMap_.assign(n, INF);
 	localGrid_.assign(n, P_FREE);
 	distWallMap_.assign(n, 30.0);
+	distUnknownMap_.assign(n, 30.0);
 }
 
-// --- BFS distance-to-wall map (update_dist_wall_map) ------------------------
+// --- BFS distance map to the nearest cell of `sourceVal` (update_dist_wall_map) ---
+// sourceVal = P_OBSTACLE gives distance-to-wall; P_UNKNOWN gives distance-to-unknown.
 namespace {
-void updateDistWallMap(const std::vector<int> & lg, std::vector<double> & dw,
-                       int w, int h, double maxDist)
+void updateDistMap(const std::vector<int> & lg, std::vector<double> & dw,
+                   int w, int h, double maxDist, int sourceVal)
 {
 	std::queue<std::pair<int,int> > q;
 	for(int y=0; y<h; ++y)
 		for(int x=0; x<w; ++x)
 		{
-			if(lg[(size_t)y*w + x] == P_OBSTACLE)
+			if(lg[(size_t)y*w + x] == sourceVal)
 			{
 				dw[(size_t)y*w + x] = 0.0;
 				q.push(std::make_pair(x, y));
@@ -169,6 +176,7 @@ void updateDistWallMap(const std::vector<int> & lg, std::vector<double> & dw,
 // --- edge cost (calc_edge_cost) --------------------------------------------
 static double calcEdgeCost(int ux, int uy, int vx, int vy,
                            const std::vector<int> & lg, const std::vector<double> & dw,
+                           const std::vector<double> & duw,
                            int w, int h, int temporalCounter)
 {
 	const int pixelVal = lg[(size_t)vy*w + vx];
@@ -213,6 +221,12 @@ static double calcEdgeCost(int ux, int uy, int vx, int vy,
 	if(dWall < D_MAX)
 		cMargin = W_MARGIN * (D_MAX - dWall);
 
+	// Gentler clearance from unexplored space (separate radius/weight from walls).
+	double dUnk = duw[(size_t)vy*w + vx];
+	double cMarginUnk = 0.0;
+	if(dUnk < D_MAX_UNKNOWN)
+		cMarginUnk = W_MARGIN_UNKNOWN * (D_MAX_UNKNOWN - dUnk);
+
 	double cDir = 0.0;
 	if(21<=pixelVal && pixelVal<=28)
 	{
@@ -224,7 +238,7 @@ static double calcEdgeCost(int ux, int uy, int vx, int vy,
 		}
 	}
 
-	return cBase + cMargin + cDir;
+	return cBase + cMargin + cMarginUnk + cDir;
 }
 
 // --- D* Lite core ----------------------------------------------------------
@@ -246,6 +260,7 @@ inline Key calculateKey(int ux, int uy, int sx, int sy,
 void updateVertex(int ux, int uy, int sx, int sy, int tx, int ty,
                   std::vector<double> & g, std::vector<double> & rhs,
                   const std::vector<int> & lg, const std::vector<double> & dw,
+                  const std::vector<double> & duw,
                   int w, int h, PQ & pq, double km, int temporal)
 {
 	if(!(ux==tx && uy==ty))
@@ -257,7 +272,7 @@ void updateVertex(int ux, int uy, int sx, int sy, int tx, int ty,
 				if(dx==0 && dy==0) continue;
 				int vx = ux+dx, vy = uy+dy;
 				if(vx<0 || vx>=w || vy<0 || vy>=h) continue;
-				double cost = calcEdgeCost(ux, uy, vx, vy, lg, dw, w, h, temporal);
+				double cost = calcEdgeCost(ux, uy, vx, vy, lg, dw, duw, w, h, temporal);
 				double val = cost + g[(size_t)vy*w + vx];
 				if(val < minRhs) minRhs = val;
 			}
@@ -271,6 +286,7 @@ void updateVertex(int ux, int uy, int sx, int sy, int tx, int ty,
 void computeShortestPath(int sx, int sy, int tx, int ty,
                          std::vector<double> & g, std::vector<double> & rhs,
                          const std::vector<int> & lg, const std::vector<double> & dw,
+                         const std::vector<double> & duw,
                          int w, int h, PQ & pq, double km, int temporal)
 {
 	while(!pq.empty())
@@ -308,20 +324,20 @@ void computeShortestPath(int sx, int sy, int tx, int ty,
 					if(dx==0 && dy==0) continue;
 					int vx = ux+dx, vy = uy+dy;
 					if(vx<0 || vx>=w || vy<0 || vy>=h) continue;
-					updateVertex(vx, vy, sx, sy, tx, ty, g, rhs, lg, dw, w, h, pq, km, temporal);
+					updateVertex(vx, vy, sx, sy, tx, ty, g, rhs, lg, dw, duw, w, h, pq, km, temporal);
 				}
 		}
 		else
 		{
 			g[(size_t)uy*w + ux] = INF;
-			updateVertex(ux, uy, sx, sy, tx, ty, g, rhs, lg, dw, w, h, pq, km, temporal);
+			updateVertex(ux, uy, sx, sy, tx, ty, g, rhs, lg, dw, duw, w, h, pq, km, temporal);
 			for(int dx=-1; dx<=1; ++dx)
 				for(int dy=-1; dy<=1; ++dy)
 				{
 					if(dx==0 && dy==0) continue;
 					int vx = ux+dx, vy = uy+dy;
 					if(vx<0 || vx>=w || vy<0 || vy>=h) continue;
-					updateVertex(vx, vy, sx, sy, tx, ty, g, rhs, lg, dw, w, h, pq, km, temporal);
+					updateVertex(vx, vy, sx, sy, tx, ty, g, rhs, lg, dw, duw, w, h, pq, km, temporal);
 				}
 		}
 	}
@@ -351,7 +367,7 @@ std::vector<std::pair<int,int> > PathGenerator::extractPath(int sx, int sy, int 
 				if(dx==0 && dy==0) continue;
 				int nx = cx+dx, ny = cy+dy;
 				if(nx<0 || nx>=gw_ || ny<0 || ny>=gh_) continue;
-				double c = calcEdgeCost(cx, cy, nx, ny, localGrid_, distWallMap_, gw_, gh_, 3)
+				double c = calcEdgeCost(cx, cy, nx, ny, localGrid_, distWallMap_, distUnknownMap_, gw_, gh_, 3)
 				           + gMap_[(size_t)ny*gw_ + nx];
 				if(c < best) { best = c; nxBest = nx; nyBest = ny; }
 			}
@@ -398,7 +414,8 @@ std::vector<std::pair<float,float> > PathGenerator::compute(
 		}
 	}
 
-	updateDistWallMap(localGrid_, distWallMap_, w, h, D_MAX);
+	updateDistMap(localGrid_, distWallMap_,    w, h, D_MAX,         P_OBSTACLE);
+	updateDistMap(localGrid_, distUnknownMap_, w, h, D_MAX_UNKNOWN, P_UNKNOWN);
 
 	// Start = robot pose cell (flipped frame).
 	auto worldToCell = [&](float wx, float wy, int & col, int & row) {
@@ -456,7 +473,7 @@ std::vector<std::pair<float,float> > PathGenerator::compute(
 	rhsMap_[(size_t)gy*w + gx] = 0.0;
 	pq.push(calculateKey(gx, gy, sx, sy, gMap_, rhsMap_, w, km));
 	computeShortestPath(sx, sy, gx, gy, gMap_, rhsMap_, localGrid_, distWallMap_,
-	                    w, h, pq, km, temporal);
+	                    distUnknownMap_, w, h, pq, km, temporal);
 
 	pathCells_ = extractPath(sx, sy, gx, gy);
 

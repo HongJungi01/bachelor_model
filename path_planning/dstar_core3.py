@@ -15,9 +15,12 @@ COST_OBSTACLE = 10000.0
 COST_UNEXPLORED = 50.0
 COST_UNEXPLORED_DIAG = 70.7
 
-D_MAX = 3.0           
-W_MARGIN = 50.0       
-TEMPORAL_THRESHOLD = 3 
+D_MAX = 8.0            # 벽 회피 반경(셀) ~0.4 m @ 0.05
+W_MARGIN = 50.0        # 벽 마진 가중치(중앙선으로 유도)
+# 미탐색 구역에 대한 별도(약한) 회피: 프런티어/목표 접근을 막지 않으면서 안개에서 떨어지도록
+D_MAX_UNKNOWN = 5.0    # 미탐색 회피 반경(셀) ~0.25 m @ 0.05
+W_MARGIN_UNKNOWN = 20.0  # 미탐색 마진 가중치(< W_MARGIN)
+TEMPORAL_THRESHOLD = 3
 
 HINT_DEPTH_K = 4    
 HINT_WIDTH_L = 2      
@@ -34,9 +37,10 @@ DIR_LUT_X[21:29] = dx_arr; DIR_LUT_Y[21:29] = dy_arr
 DIR_LUT_X[31:39] = dx_arr; DIR_LUT_Y[31:39] = dy_arr 
 
 @njit(fastmath=True)
-def update_dist_wall_map(local_grid, dist_wall_map, max_dist):
+def update_dist_wall_map(local_grid, dist_wall_map, max_dist, source_val):
+    # source_val=100 -> distance-to-wall; source_val=255 -> distance-to-unknown.
     h, w = local_grid.shape
-    MAX_Q = h * w * 4 
+    MAX_Q = h * w * 4
     qx = np.zeros(MAX_Q, dtype=np.int32)
     qy = np.zeros(MAX_Q, dtype=np.int32)
     head = 0
@@ -44,7 +48,7 @@ def update_dist_wall_map(local_grid, dist_wall_map, max_dist):
 
     for y in range(h):
         for x in range(w):
-            if local_grid[y, x] == 100:
+            if local_grid[y, x] == source_val:
                 dist_wall_map[y, x] = 0.0
                 qx[tail] = x
                 qy[tail] = y
@@ -91,7 +95,7 @@ def calculate_key(u_x, u_y, start_x, start_y, g_map, rhs_map, km):
     return (k1, k2, np.int64(u_x), np.int64(u_y))
 
 @njit(fastmath=True)
-def calc_edge_cost(u_x, u_y, v_x, v_y, local_grid, dist_wall_map, temporal_counter):
+def calc_edge_cost(u_x, u_y, v_x, v_y, local_grid, dist_wall_map, dist_unknown_map, temporal_counter):
     pixel_val = local_grid[v_y, v_x]
     is_diag = (u_x != v_x) and (u_y != v_y)
 
@@ -136,7 +140,13 @@ def calc_edge_cost(u_x, u_y, v_x, v_y, local_grid, dist_wall_map, temporal_count
     c_margin = 0.0
     if d_wall < D_MAX:
         c_margin = W_MARGIN * (D_MAX - d_wall)
-        
+
+    # 미탐색 구역에 대한 별도(약한) 회피 마진
+    d_unk = dist_unknown_map[v_y, v_x]
+    c_margin_unk = 0.0
+    if d_unk < D_MAX_UNKNOWN:
+        c_margin_unk = W_MARGIN_UNKNOWN * (D_MAX_UNKNOWN - d_unk)
+
     c_dir = 0.0
     if 21 <= pixel_val <= 28: 
         if temporal_counter >= TEMPORAL_THRESHOLD:
@@ -145,11 +155,11 @@ def calc_edge_cost(u_x, u_y, v_x, v_y, local_grid, dist_wall_map, temporal_count
             if ((v_x - u_x) * allowed_dx) + ((v_y - u_y) * allowed_dy) < 0:
                 c_dir = COST_OBSTACLE
 
-    return c_base + c_margin + c_dir
+    return c_base + c_margin + c_margin_unk + c_dir
 
 @njit(fastmath=True)
 def update_vertex(u_x, u_y, start_x, start_y, target_x, target_y, 
-                  g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter):
+                  g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter):
     if not (u_x == target_x and u_y == target_y):
         min_rhs = np.inf
         h, w = local_grid.shape
@@ -158,7 +168,7 @@ def update_vertex(u_x, u_y, start_x, start_y, target_x, target_y,
                 if dx == 0 and dy == 0: continue
                 v_x, v_y = u_x + dx, u_y + dy
                 if 0 <= v_x < w and 0 <= v_y < h:
-                    cost = calc_edge_cost(u_x, u_y, v_x, v_y, local_grid, dist_wall_map, temporal_counter)
+                    cost = calc_edge_cost(u_x, u_y, v_x, v_y, local_grid, dist_wall_map, dist_unknown_map, temporal_counter)
                     val = cost + g_map[v_y, v_x]
                     if val < min_rhs:
                         min_rhs = val
@@ -170,7 +180,7 @@ def update_vertex(u_x, u_y, start_x, start_y, target_x, target_y,
 
 @njit
 def compute_shortest_path(start_x, start_y, target_x, target_y, 
-                          g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter):
+                          g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter):
     while len(pq) > 0:
         k_old_1, k_old_2, u_x, u_y = heapq.heappop(pq)
         k_new = calculate_key(u_x, u_y, start_x, start_y, g_map, rhs_map, km)
@@ -199,11 +209,11 @@ def compute_shortest_path(start_x, start_y, target_x, target_y,
                     v_x, v_y = u_x + dx, u_y + dy
                     if 0 <= v_x < w and 0 <= v_y < h:
                         update_vertex(v_x, v_y, start_x, start_y, target_x, target_y, 
-                                      g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter)
+                                      g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter)
         else:
             g_map[u_y, u_x] = np.inf
             update_vertex(u_x, u_y, start_x, start_y, target_x, target_y, 
-                          g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter)
+                          g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter)
             h, w = local_grid.shape
             for dx in (-1, 0, 1):
                 for dy in (-1, 0, 1):
@@ -211,28 +221,28 @@ def compute_shortest_path(start_x, start_y, target_x, target_y,
                     v_x, v_y = u_x + dx, u_y + dy
                     if 0 <= v_x < w and 0 <= v_y < h:
                         update_vertex(v_x, v_y, start_x, start_y, target_x, target_y, 
-                                      g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter)
+                                      g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter)
 
 @njit
-def reset_and_replan(start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter):
+def reset_and_replan(start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter):
     g_map.fill(np.inf)
     rhs_map.fill(np.inf)
     pq.clear()
     rhs_map[target_y, target_x] = 0.0
     init_key = calculate_key(target_x, target_y, start_x, start_y, g_map, rhs_map, km)
     heapq.heappush(pq, init_key)
-    compute_shortest_path(start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter)
+    compute_shortest_path(start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter)
 
 @njit
-def apply_map_changes(changed_x, changed_y, start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter):
+def apply_map_changes(changed_x, changed_y, start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter):
     for i in range(len(changed_x)):
         cx = changed_x[i]
         cy = changed_y[i]
-        update_vertex(cx, cy, start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter)
+        update_vertex(cx, cy, start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter)
         h, w = local_grid.shape
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 if dx == 0 and dy == 0: continue
                 nx, ny = cx + dx, cy + dy
                 if 0 <= nx < w and 0 <= ny < h:
-                    update_vertex(nx, ny, start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, pq, km, temporal_counter)
+                    update_vertex(nx, ny, start_x, start_y, target_x, target_y, g_map, rhs_map, local_grid, dist_wall_map, dist_unknown_map, pq, km, temporal_counter)

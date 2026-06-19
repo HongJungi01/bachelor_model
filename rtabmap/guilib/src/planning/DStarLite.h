@@ -88,6 +88,7 @@ private:
 	std::vector<double> rhsMap_;      // rhs values          [y*w + x]
 	std::vector<int>    localGrid_;   // planner legend      [y*w + x]
 	std::vector<double> distWallMap_; // distance-to-wall    [y*w + x]
+	std::vector<double> distUnknownMap_; // distance-to-unknown [y*w + x]
 
 	std::vector<std::pair<int, int> > pathCells_;
 	std::pair<int, int> startCell_{0, 0};
