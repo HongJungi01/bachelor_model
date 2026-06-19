@@ -27,6 +27,8 @@ class QPushButton;
 class QLabel;
 class QSlider;
 class QSpinBox;
+class QDoubleSpinBox;
+class QCheckBox;
 class QPlainTextEdit;
 class QTimer;
 
@@ -36,6 +38,8 @@ class QSerialPort;
 
 namespace rtabmap {
 
+class MapPathView;
+
 class ControllerPanel : public QWidget
 {
 	Q_OBJECT
@@ -43,6 +47,10 @@ class ControllerPanel : public QWidget
 public:
 	explicit ControllerPanel(QWidget * parent = 0);
 	virtual ~ControllerPanel();
+
+	// Wire the Map+Path dock so Auto mode can read its planned path + live pose
+	// (pure-pursuit path following). Set once by MainWindow after both are created.
+	void setMapPathView(MapPathView * view) { mapPath_ = view; }
 
 protected:
 	void keyPressEvent(QKeyEvent * event);
@@ -59,12 +67,17 @@ private Q_SLOTS:
 	void resetAngle();
 	void allStop();
 	void syncHoldValues();
+	void onAutoModeToggled(bool on);
+	void syncAutoValues();
 
 private:
 	void buildGui();
+	void applyAutoControl();              // auto mode: drive angle/speed from the path
+	bool computeAutoSteering(int & angleOut); // pure-pursuit steer (-20..20) from MapPathView
 	void connectSerial();
 	void disconnectSerial();
 	void parseFeedback(const QString & line);
+	void drainRxBuffer();
 	void appendLog(const QString & msg);
 	void rampSpeed();
 	void applyHeldKeys();
@@ -88,6 +101,9 @@ private:
 	QLabel *         angleValLabel_ = nullptr;
 	QSpinBox *       holdSpeedSpin_ = nullptr;
 	QSpinBox *       holdAngleSpin_ = nullptr;
+	QCheckBox *      autoModeCheck_ = nullptr;
+	QSpinBox *       autoSpeedSpin_ = nullptr;
+	QDoubleSpinBox * lookAheadSpin_ = nullptr;
 	QLabel *         encDeltaLabel_ = nullptr;
 	QLabel *         potLabel_      = nullptr;
 	QLabel *         encCumLabel_   = nullptr;
@@ -97,6 +113,8 @@ private:
 
 #ifdef RTABMAP_HAVE_QT_SERIALPORT
 	QSerialPort *    serial_ = nullptr;
+#elif defined(_WIN32)
+	void *           winSerial_ = nullptr; // HANDLE; nullptr = closed (keeps <windows.h> out of header)
 #endif
 	QByteArray rxBuf_;
 
@@ -107,6 +125,12 @@ private:
 	double targetSpeed_ = 0.0;   // ramp target
 	int    holdSpeed_   = 5;     // W/S target speed
 	int    holdAngle_   = 15;    // A/D steering angle
+
+	// auto mode (path following via MapPathView pure-pursuit)
+	bool   autoMode_    = false;
+	int    autoSpeed_   = 3;     // forward speed while auto mode is on (controller units)
+	double lookAhead_   = 0.7;   // pure-pursuit look-ahead distance (metres)
+	MapPathView * mapPath_ = nullptr;
 
 	// feedback
 	int encDelta_ = 0, potValue_ = 0, encCumulative_ = 0;

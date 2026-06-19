@@ -68,7 +68,8 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include "rtabmap/gui/ProgressDialog.h"
 #include "rtabmap/gui/CloudViewer.h"
 #include "MapPathView.h"
-#include "ControllerPanel.h"
+#include "AutopilotPanel.h"
+#include "rtabmap/gui/PlanTcpStreamer.h"
 #include "rtabmap/gui/LoopClosureViewer.h"
 #include "rtabmap/gui/ExportCloudsDialog.h"
 #include "rtabmap/gui/ExportBundlerDialog.h"
@@ -288,11 +289,16 @@ MainWindow::MainWindow(PreferencesDialog * prefDialog, QWidget * parent, bool sh
 	addDockWidget(Qt::LeftDockWidgetArea, _dockMapPath);
 	_ui->menuShow_view->addAction(_dockMapPath->toggleViewAction());
 
-	// Controller (top-right): PID speed/steering serial debug panel.
-	_dockController = new QDockWidget(tr("Controller"), this);
+	// Autopilot (top-right): streams the planned path + live pose to the external
+	// controller process (default_Controller.py), which computes pure-pursuit and
+	// drives the vehicle on its own steady loop — immune to GUI lag.
+	_planTcpStreamer = new PlanTcpStreamer(5006, this);
+	connect(_planTcpStreamer, SIGNAL(statusMessage(QString)), this, SLOT(onTcpStatusMessage(QString)));
+	_planTcpStreamer->startListening();
+	_dockController = new QDockWidget(tr("Autopilot"), this);
 	_dockController->setObjectName("dockWidget_controller");
-	_controllerPanel = new ControllerPanel(_dockController);
-	_dockController->setWidget(_controllerPanel);
+	_autopilotPanel = new AutopilotPanel(_planTcpStreamer, _dockController);
+	_dockController->setWidget(_autopilotPanel);
 	addDockWidget(Qt::RightDockWidgetArea, _dockController);
 	_ui->menuShow_view->addAction(_dockController->toggleViewAction());
 
@@ -1369,6 +1375,21 @@ void MainWindow::processOdometry(const rtabmap::OdometryEvent & odom, bool dataI
 		// whose robot marker would otherwise freeze at the origin because the stock
 		// cloud/graph docks that used to gate this are hidden in the 4-quadrant layout.
 		_lastOdomPose = pose;
+
+		// Feed the live (map-frame) pose to the Map+Path dock at odometry rate. This is
+		// decoupled from the grid/D* cadence: the dock replans only every ~2 s, but the
+		// pose marker (and any path-following computed from it) must stay real-time.
+		if(_mapPathView && _dockMapPath && _dockMapPath->isVisible())
+		{
+			Transform mapPose = _odometryCorrection * pose;
+			_mapPathView->updatePose(mapPose.x(), mapPose.y(), mapPose.theta());
+		}
+		// Stream the live pose to the external controller (decoupled from any dock).
+		if(_planTcpStreamer)
+		{
+			Transform mapPose = _odometryCorrection * pose;
+			_planTcpStreamer->sendPose(mapPose.x(), mapPose.y(), mapPose.theta());
+		}
 	}
 
 	const SensorData * data = &odom.data();
@@ -3919,6 +3940,19 @@ void MainWindow::updateMapCloud(
 					pYaw = mapPose.theta();
 				}
 				_mapPathView->updateGrid(map8S, xMin, yMin, resolution, pX, pY, pYaw);
+
+				// Forward the latest planned path to the external controller.
+				if(_planTcpStreamer)
+				{
+					std::vector<std::pair<float, float> > worldPath;
+					float lx = 0.f, ly = 0.f, lyaw = 0.f;
+					if(_mapPathView->latestPlanAndPose(worldPath, lx, ly, lyaw))
+					{
+						_planTcpStreamer->sendPath(worldPath);
+						if(_autopilotPanel)
+							_autopilotPanel->showStreamInfo(lx, ly, lyaw, (int)worldPath.size());
+					}
+				}
 			}
 
 			if(_cloudViewer->isVisible() && _preferencesDialog->getGridMapShown())

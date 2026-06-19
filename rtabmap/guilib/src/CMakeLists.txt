@@ -85,10 +85,13 @@ SET(SRC_FILES
 	./DepthCalibrationDialog.cpp
 	./LinkRefiningDialog.cpp
 	./GridTcpStreamer.cpp
+	./PlanTcpStreamer.cpp
 	./MapPathView.cpp
 	./MapPathView.h
 	./ControllerPanel.cpp
 	./ControllerPanel.h
+	./AutopilotPanel.cpp
+	./AutopilotPanel.h
 	./planning/DStarLite.cpp
 	./planning/DStarLite.h
 	./3rdParty/QMultiComboBox.cpp

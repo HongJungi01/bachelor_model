@@ -58,8 +58,10 @@ class CloudViewer;
 class LoopClosureViewer;
 class OccupancyGrid;
 class GridTcpStreamer;
+class PlanTcpStreamer;
 class MapPathView;
 class ControllerPanel;
+class AutopilotPanel;
 }
 
 class QGraphicsScene;
@@ -460,6 +462,8 @@ private:
 	// TCP Grid Streaming
 	GridTcpStreamer * _gridTcpStreamer;
 	QAction * _actionTcpGridStreaming;
+	// Path+pose stream to the external controller (default_Controller.py)
+	PlanTcpStreamer * _planTcpStreamer = nullptr;
 
 	// Semantic SLAM (parking line → wall tagging via async YOLO sidecar)
 	std::unique_ptr<::SemanticWorker>    _semanticWorker;
@@ -480,6 +484,7 @@ private:
 	QElapsedTimer _mapPathGridTimer;
 	QDockWidget * _dockController = nullptr;
 	ControllerPanel * _controllerPanel = nullptr;
+	AutopilotPanel * _autopilotPanel = nullptr;
 	// Tile the four docks into a 2x2: Odometry top-left / Controller top-right /
 	// Semantic bottom-left / Map+Path bottom-right.
 	void applyQuadrantLayout();
