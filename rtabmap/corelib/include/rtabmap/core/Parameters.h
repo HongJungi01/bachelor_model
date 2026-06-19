@@ -179,7 +179,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(Rtabmap, SaveWMState,                  bool, false, "Save working memory state after each update in statistics.");
     RTABMAP_PARAM(Rtabmap, TimeThr,                      float, 0,    "Maximum time allowed for map update (ms) (0 means infinity). When map update time exceeds this fixed time threshold, some nodes in Working Memory (WM) are transferred to Long-Term Memory to limit the size of the WM and decrease the update time.");
     RTABMAP_PARAM(Rtabmap, MemoryThr,                    int, 0,      uFormat("Maximum nodes in the Working Memory (0 means infinity). Similar to \"%s\", when the number of nodes in Working Memory (WM) exceeds this treshold, some nodes are transferred to Long-Term Memory to keep WM size fixed.", kRtabmapTimeThr().c_str()));
-    RTABMAP_PARAM(Rtabmap, DetectionRate,                float, 1,    "Detection rate (Hz). RTAB-Map will filter input images to satisfy this rate.");
+    RTABMAP_PARAM(Rtabmap, DetectionRate,                float, 0,    "Detection rate (Hz). RTAB-Map will filter input images to satisfy this rate.");
     RTABMAP_PARAM(Rtabmap, ImageBufferSize,          unsigned int, 1, "Data buffer size (0 min inf).");
     RTABMAP_PARAM(Rtabmap, CreateIntermediateNodes,      bool, false, uFormat("Create intermediate nodes between loop closure detection. Only used when %s>0.", kRtabmapDetectionRate().c_str()));
     RTABMAP_PARAM_STR(Rtabmap, WorkingDirectory,         "",          "Working directory.");
@@ -396,7 +396,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(RGBD, LoopClosureReextractFeatures, bool, false,  "Extract features even if there are some already in the nodes. Raw features are not saved in database.");
     RTABMAP_PARAM(RGBD, LocalBundleOnLoopClosure,     bool, false,  "Do local bundle adjustment with neighborhood of the loop closure.");
     RTABMAP_PARAM(RGBD, InvertedReg,                  bool, false,  "On loop closure, do registration from the target to reference instead of reference to target.");
-    RTABMAP_PARAM(RGBD, CreateOccupancyGrid,          bool, false,  "Create local occupancy grid maps. See \"Grid\" group for parameters.");
+    RTABMAP_PARAM(RGBD, CreateOccupancyGrid,          bool, true,   "Create local occupancy grid maps. See \"Grid\" group for parameters.");
     RTABMAP_PARAM(RGBD, MarkerDetection,              bool, false,  "Detect static markers to be added as landmarks for graph optimization. If input data have already landmarks, this will be ignored. See \"Marker\" group for parameters.");
     RTABMAP_PARAM(RGBD, LoopCovLimited,               bool, false,  "Limit covariance of non-neighbor links to minimum covariance of neighbor links. In other words, if covariance of a loop closure link is smaller than the minimum covariance of odometry links, its covariance is set to minimum covariance of odometry links.");
     RTABMAP_PARAM(RGBD, MaxOdomCacheSize,             int,  10,      uFormat("Maximum odometry cache size. Used only in localization mode (when %s=false). This is used to get smoother localizations and to verify localization transforms (when %s!=0) to make sure we don't teleport to a location very similar to one we previously localized on. Set 0 to disable caching.", kMemIncrementalMemory().c_str(), kRGBDOptimizeMaxError().c_str()));
@@ -875,7 +875,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(Grid, Sensor,                  int,    1,       "Create occupancy grid from selected sensor: 0=laser scan, 1=depth image(s) or 2=both laser scan and depth image(s).");
     RTABMAP_PARAM(Grid, DepthDecimation,         unsigned int,  4, uFormat("[%s=true] Decimation of the depth image before creating cloud.", kGridDepthDecimation().c_str()));
     RTABMAP_PARAM(Grid, RangeMin,                float,  0.0,     "Minimum range from sensor.");
-    RTABMAP_PARAM(Grid, RangeMax,                float,  5.0,     "Maximum range from sensor. 0=inf.");
+    RTABMAP_PARAM(Grid, RangeMax,                float,  8.0,     "Maximum range from sensor. 0=inf.");
     RTABMAP_PARAM_STR(Grid, DepthRoiRatios,      "0.0 0.0 0.0 0.0", uFormat("[%s>=1] Region of interest ratios [left, right, top, bottom].", kGridSensor().c_str()));
     RTABMAP_PARAM(Grid, FootprintLength,         float,  0.0,     "Footprint length used to filter points over the footprint of the robot.");
     RTABMAP_PARAM(Grid, FootprintWidth,          float,  0.0,     "Footprint width used to filter points over the footprint of the robot. Footprint length should be set.");
@@ -884,12 +884,12 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(Grid, CellSize,                float,  0.05,    "Resolution of the occupancy grid.");
     RTABMAP_PARAM(Grid, PreVoxelFiltering,       bool,   true,    uFormat("Input cloud is downsampled by voxel filter (voxel size is \"%s\") before doing segmentation of obstacles and ground.", kGridCellSize().c_str()));
     RTABMAP_PARAM(Grid, MapFrameProjection,      bool,   false,   "Projection in map frame. On a 3D terrain and a fixed local camera transform (the cloud is created relative to ground), you may want to disable this to do the projection in robot frame instead.");
-    RTABMAP_PARAM(Grid, NormalsSegmentation,     bool,   true,    "Segment ground from obstacles using point normals, otherwise a fast passthrough is used.");
+    RTABMAP_PARAM(Grid, NormalsSegmentation,     bool,   false,   "Segment ground from obstacles using point normals, otherwise a fast passthrough is used.");
     // Defaults below assume the project's vehicle: camera mounted level at
-    // 1.0 m above base_link (which sits on the floor), flat parking lot.
-    RTABMAP_PARAM(Grid, MaxObstacleHeight,       float,  1.5,     "Maximum obstacles height (0=disabled).");
-    RTABMAP_PARAM(Grid, MinGroundHeight,         float,  -0.3,    "Minimum ground height (0=disabled).");
-    RTABMAP_PARAM(Grid, MaxGroundHeight,         float,  0.2,     uFormat("Maximum ground height (0=disabled). Should be set if \"%s\" is false.", kGridNormalsSegmentation().c_str()));
+    // 0.85 m above base_link (which sits on the floor), flat parking lot.
+    RTABMAP_PARAM(Grid, MaxObstacleHeight,       float,  0.5,     "Maximum obstacles height (0=disabled).");
+    RTABMAP_PARAM(Grid, MinGroundHeight,         float,  -2.0,    "Minimum ground height (0=disabled).");
+    RTABMAP_PARAM(Grid, MaxGroundHeight,         float,  0.0,     uFormat("Maximum ground height (0=disabled). Should be set if \"%s\" is false.", kGridNormalsSegmentation().c_str()));
     RTABMAP_PARAM(Grid, MaxGroundAngle,          float,  45,      uFormat("[%s=true] Maximum angle (degrees) between point's normal to ground's normal to label it as ground. Points with higher angle difference are considered as obstacles.", kGridNormalsSegmentation().c_str()));
     RTABMAP_PARAM(Grid, NormalK,                 int,    20,      uFormat("[%s=true] K neighbors to compute normals.", kGridNormalsSegmentation().c_str()));
     RTABMAP_PARAM(Grid, ClusterRadius,           float,  0.1,     uFormat("[%s=true] Cluster maximum radius.", kGridNormalsSegmentation().c_str()));
@@ -904,7 +904,7 @@ class RTABMAP_CORE_EXPORT Parameters
     RTABMAP_PARAM(Grid, NoiseFilteringRadius,       float,   0.0,    "Noise filtering radius (0=disabled). Done after segmentation.");
     RTABMAP_PARAM(Grid, NoiseFilteringMinNeighbors, int,     5,      "Noise filtering minimum neighbors.");
     RTABMAP_PARAM(Grid, Scan2dUnknownSpaceFilled,   bool,    false,  uFormat("Unknown space filled. Only used with 2D laser scans. Use %s to set maximum range if laser scan max range is to set.", kGridRangeMax().c_str()));
-    RTABMAP_PARAM(Grid, RayTracing,                 bool,   true,    uFormat("Ray tracing is done for each occupied cell, filling unknown space between the sensor and occupied cells. If %s=true, RTAB-Map should be built with OctoMap support, otherwise 3D ray tracing is ignored.", kGrid3D().c_str()));
+    RTABMAP_PARAM(Grid, RayTracing,                 bool,   false,   uFormat("Ray tracing is done for each occupied cell, filling unknown space between the sensor and occupied cells. If %s=true, RTAB-Map should be built with OctoMap support, otherwise 3D ray tracing is ignored.", kGrid3D().c_str()));
     RTABMAP_PARAM(GridGlobal, UpdateError,          float,  0.01,    "Graph changed detection error (m). Update map only if poses in new optimized graph have moved more than this value.");
     RTABMAP_PARAM(GridGlobal, FootprintRadius,      float,  0.0,     "Footprint radius (m) used to clear all obstacles under the graph.");
     RTABMAP_PARAM(GridGlobal, MinSize,              float,  0.0,     "Minimum map size (m).");

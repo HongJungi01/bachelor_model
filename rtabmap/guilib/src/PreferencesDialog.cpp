@@ -2223,8 +2223,8 @@ void PreferencesDialog::resetSettings(QGroupBox * groupBox)
 		_ui->lineEdit_calibrationFile->clear();
 		_ui->comboBox_sourceType->setCurrentIndex(kSrcRGBD);
 		_ui->lineEdit_sourceDevice->setText("");
-		// Project default: camera mounted level, 1.0 m above base_link.
-		_ui->lineEdit_sourceLocalTransform->setText("0 0 1 0 0 0");
+		// Project default: camera mounted level, 0.85 m above base_link.
+		_ui->lineEdit_sourceLocalTransform->setText("0 0 0.85 0 0 0");
 
 		_ui->source_comboBox_image_type->setCurrentIndex(kSrcUsbDevice-kSrcUsbDevice);
 		_ui->source_images_spinBox_startPos->setValue(0);
@@ -2248,10 +2248,18 @@ void PreferencesDialog::resetSettings(QGroupBox * groupBox)
 		_ui->source_checkBox_overrideLocalTransforms->setChecked(false);
 		_ui->source_lineEdit_databaseLocalTransformOffset->setText("");
 
+		// Project default: prefer RealSense2 when available, else per-platform fallback.
+		if(CameraRealSense2::available())
+		{
+			_ui->comboBox_cameraRGBD->setCurrentIndex(kSrcRealSense2-kSrcRGBD); // realsense2
+		}
 #ifdef _WIN32
-		_ui->comboBox_cameraRGBD->setCurrentIndex(kSrcOpenNI2-kSrcRGBD); // openni2
+		else
+		{
+			_ui->comboBox_cameraRGBD->setCurrentIndex(kSrcOpenNI2-kSrcRGBD); // openni2
+		}
 #else
-		if(CameraFreenect::available())
+		else if(CameraFreenect::available())
 		{
 			_ui->comboBox_cameraRGBD->setCurrentIndex(kSrcFreenect-kSrcRGBD); // freenect
 		}
