@@ -81,7 +81,16 @@ public:
 
 private:
 	void ensure(int w, int h);
-	std::vector<std::pair<int, int> > extractPath(int sx, int sy, int gx, int gy) const;
+	std::vector<std::pair<int, int> > extractPath(int sx, int sy, int gx, int gy,
+	                                              double dMax, double dMaxUnk) const;
+
+	// Plan one uniform-resolution frame (any cell size) to an explicit world goal,
+	// reusing the full D* Lite pipeline. Fills outCellPath (this grid's flipped frame)
+	// when non-null. Used for both the coarse global pass and the fine local window.
+	std::vector<std::pair<float, float> > planFrame(
+			const GridMeta & meta, const cv::Mat & rawI8,
+			float goalWx, float goalWy,
+			std::vector<std::pair<int, int> > * outCellPath = 0);
 
 	int gw_ = 0, gh_ = 0;
 	std::vector<double> gMap_;        // g values            [y*w + x]
